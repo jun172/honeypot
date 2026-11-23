@@ -7,7 +7,11 @@ import socket
 import threading
 from datetime import datetime, timezone
 from typing import cast
+from urllib.parse import unquote
 
+# ==========================================
+# 環境変数・設定管理
+# ==========================================
 HP_HOST = os.getenv("HP_HOST", "0.0.0.0")
 HP_PORTS_ENV = os.getenv("HP_PORTS", os.getenv("HP_PORT", "8080"))
 HP_MODE = os.getenv("HP_MODE", "realistic").strip().lower()  # "realistic" or "simple"
@@ -25,53 +29,93 @@ ALLOWED_METHODS = {
 }
 
 CRAWLER_UA_TOKENS = (
-    "google-lens",
-    "googlebot",
-    "adsbot-google",
-    "apis-google",
-    "mediapartners-google",
-    "bingbot",
-    "yandexbot",
-    "duckduckbot",
+    "google-lens", "googlebot", "adsbot-google", "apis-google",
+    "mediapartners-google", "bingbot", "yandexbot", "duckduckbot",
 )
 
 SCANNER_UA_TOKENS = (
-    "zgrab",
-    "masscan",
-    "nmap",
-    "nikto",
-    "sqlmap",
-    "curl/",
-    "python-requests",
-    "go-http-client",
-    "censys",
-    "shodan",
-    "onyphe",
+    "zgrab", "masscan", "nmap", "nikto", "sqlmap",
+    "curl/", "python-requests", "go-http-client", "censys", "shodan", "onyphe",
 )
 
+# 検出用正規表現・パターン
 CRED_ENV_PATTERNS = re.compile(
     r"(\.env|aws_access_key|secret_key|private_key|id_rsa|passwd|shadow|/proc/self/environ|wp-config\.php)",
     re.IGNORECASE,
 )
 TRAVERSAL_PATTERNS = re.compile(r"(\.\./|\.\.\\|%2e%2e)", re.IGNORECASE)
 CMD_INJECTION_PATTERNS = re.compile(
-    r"(;\s*(sh|bash|wget|curl|chmod|rm|cat|uname|id)\b|`[^`]+`|\$\([^)]+\)|/bin/(sh|bash))",
+    r"(;\s*(sh|bash|wget|curl|tftp|ftpget|nc|chmod|rm|cat|uname|id|busybox)\b|`[^`]+`|\$\([^)]+\)|/bin/(sh|bash)|(?:cmd|command|exec|target_addr)=)",
     re.IGNORECASE,
 )
+LOG4SHELL_PATTERNS = re.compile(
+    r"\$\{\s*(?:jndi|lower|upper)\s*:\s*(?:ldap|ldaps|rmi|dns|iiop)s?[:/]",
+    re.IGNORECASE,
+)
+NEXTJS_RCE_PATTERNS = re.compile(
+    r"(?:__next_error__|child_process|execSync|spawnSync|process\.mainModule|require\(['\"]child_process['\"]\))",
+    re.IGNORECASE,
+)
+BOA_ROUTER_PATTERNS = re.compile(r"(/boaform/|formsyscmd|formlogin|formping)", re.IGNORECASE)
 IOT_ROUTER_PATHS = (
-    "/boaform/",
-    "/cgi-bin/",
-    "/hnap1",
-    "/setup.cgi",
-    "/goform/",
-    "/stalker_portal",
-    "/sdk",
-    "/device.rsp",
+    "/boaform/", "/cgi-bin/", "/hnap1", "/setup.cgi",
+    "/goform/", "/stalker_portal", "/sdk", "/device.rsp",
 )
 
-HTML_BODY = (
-    b"<!doctype html><html><head><title>Router Management</title></head>"
-    b"<body><h1>Device Portal</h1><p>Authentication required.</p></body></html>\n"
+# IOC抽出用正規表現
+URL_IOC_RE = re.compile(
+    r"((?:https?|ftp|hxxp)://[^\s\"'<>|\\)}\]]+)",
+    re.IGNORECASE,
+)
+C2_ENDPOINT_RE = re.compile(
+    r"(?:\b(?:nc|ncat|netcat)\b[^\r\n;|&]*?\b\d{1,5}\b|/dev/(?:tcp|udp)/[^\s\"';|&)]+/[^\s\"';|&)]+|(?:\.connect|socket\.connect|connect_ex)\s*\([^\r\n;)]{1,120}\))",
+    re.IGNORECASE,
+)
+IPV4_IOC_RE = re.compile(
+    r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?::\d{1,5})?\b"
+)
+CMD_TOKEN_RE = re.compile(
+    r"\b(wget|curl|tftp|ftpget|nc|ncat|busybox|chmod|nohup|sh|bash|python|perl|jndi)\b",
+    re.IGNORECASE,
+)
+
+# ダミー／偽装レスポンス素材（すべて検証用のダミー値）
+FAKE_ENV_BODY = (
+    b"APP_ENV=production\n"
+    b"APP_DEBUG=false\n"
+    b"AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE_HONEYPOT\n"
+    b"AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY_HONEYPOT\n"
+    b"AWS_DEFAULT_REGION=ap-northeast-1\n"
+    b"DB_CONNECTION=mysql\n"
+    b"DB_HOST=127.0.0.1\n"
+    b"DB_PORT=3306\n"
+    b"DB_DATABASE=portal_db\n"
+    b"DB_USERNAME=portal_admin\n"
+    b"DB_PASSWORD=ChangeMe_DummyPass_123!\n"
+)
+
+BOA_DECOY_HTML = (
+    b"<!doctype html><html><head><title>Gateway System</title></head>"
+    b"<body><h3>System Command</h3>"
+    b"<p>Status: Authenticated (admin)</p>"
+    b"<pre>Command executed successfully.\n# </pre></body></html>\n"
+)
+
+ROUTER_LOGIN_HTML = (
+    b"<!doctype html><html><head><title>Broadband Gateway</title></head>"
+    b"<body><h2>Device Login</h2>"
+    b"<form method='POST' action='/boaform/admin/formLogin'>"
+    b"<input name='username' placeholder='Username'/>"
+    b"<input name='password' type='password' placeholder='Password'/>"
+    b"<button type='submit'>Login</button></form></body></html>\n"
+)
+
+HNAP_XML_BODY = (
+    b'<?xml version="1.0" encoding="utf-8"?>'
+    b'<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+    b'<soap:Body><GetDeviceSettingsResponse xmlns="http://purenetworks.com/HNAP1/">'
+    b'<GetDeviceSettingsResult>OK</GetDeviceSettingsResult>'
+    b'<ModelName>DSL-Router</ModelName></GetDeviceSettingsResponse></soap:Body></soap:Envelope>\n'
 )
 
 _conn_sema = threading.Semaphore(MAX_CONNECTIONS)
@@ -124,17 +168,68 @@ def get_first_header(headers_dict: dict, name: str) -> str:
     return ""
 
 
+# ==========================================
+# IOC自動抽出機能
+# ==========================================
+def extract_iocs(path: str, body_text: str, headers_clean: dict) -> dict:
+    decoded_path = unquote(path)
+    decoded_body = unquote(body_text)
+    header_dump = json.dumps(headers_clean, ensure_ascii=False)
+    combined = f"{path}\n{decoded_path}\n{body_text}\n{decoded_body}\n{header_dump}"
+
+    urls: list[str] = []
+    for m in URL_IOC_RE.findall(combined):
+        cleaned = m.rstrip(".,;)")
+        if cleaned not in urls:
+            urls.append(cleaned)
+
+    c2_endpoints: list[str] = []
+    for m in C2_ENDPOINT_RE.findall(combined):
+        cleaned = m.strip()
+        if cleaned and cleaned not in c2_endpoints:
+            c2_endpoints.append(cleaned)
+
+    ips: list[str] = []
+    for ip in IPV4_IOC_RE.findall(combined):
+        if ip not in ips:
+            ips.append(ip)
+
+    cmds: list[str] = []
+    for cmd in CMD_TOKEN_RE.findall(combined):
+        low = cmd.lower()
+        if low not in cmds:
+            cmds.append(low)
+
+    return {
+        "iocs": {
+            "urls": urls[:50],
+            "c2_endpoints": c2_endpoints[:50],
+            "ips": ips[:50],
+            "commands": cmds[:30],
+        },
+        "has_ioc": bool(urls or c2_endpoints),
+    }
+
+
+# ==========================================
+# リクエスト解析
+# ==========================================
 def analyze_request(
     method: str,
     path: str,
     user_agent: str,
     body_text: str,
     body_read_len: int,
+    headers_clean: dict | None = None,
     raw_request_line: str = "",
 ) -> dict:
+    headers_clean = headers_clean or {}
     ua_lower = user_agent.lower()
     path_lower = path.lower()
-    haystack = f"{path}\n{body_text}"
+    decoded_path = unquote(path)
+    decoded_body = unquote(body_text)
+    header_dump = json.dumps(headers_clean, ensure_ascii=False)
+    haystack = f"{path}\n{decoded_path}\n{body_text}\n{decoded_body}\n{header_dump}"
 
     is_crawler = any(tok in ua_lower for tok in CRAWLER_UA_TOKENS)
     is_scanner_ua = any(tok in ua_lower for tok in SCANNER_UA_TOKENS)
@@ -146,6 +241,15 @@ def analyze_request(
     )
     is_tls_handshake = raw_request_line.startswith("\\u0016\\u0003") or (
         len(raw_request_line) >= 2 and raw_request_line[:2] == "\x16\x03"
+    )
+
+    has_next_action = bool(get_first_header(headers_clean, "Next-Action"))
+    is_nextjs_rce = has_next_action or bool(NEXTJS_RCE_PATTERNS.search(haystack))
+    is_boa_router = bool(BOA_ROUTER_PATTERNS.search(haystack))
+    is_log4shell = bool(LOG4SHELL_PATTERNS.search(haystack))
+    is_open_proxy = (
+        method.upper() == "CONNECT"
+        or (method.upper() == "GET" and re.match(r"^https?://", path, re.IGNORECASE) is not None)
     )
 
     tags: list[str] = []
@@ -160,6 +264,18 @@ def analyze_request(
     if any(path_lower.startswith(p) for p in IOT_ROUTER_PATHS):
         tags.append("iot_router_path")
         score += 35
+    if is_boa_router:
+        tags.append("boa_router_probe")
+        score += 35
+    if is_nextjs_rce:
+        tags.append("nextjs_rce")
+        score += 65
+    if is_log4shell:
+        tags.append("log4shell")
+        score += 65
+    if is_open_proxy:
+        tags.append("open_proxy_probe")
+        score += 30
     if TRAVERSAL_PATTERNS.search(haystack):
         tags.append("path_traversal")
         score += 45
@@ -169,6 +285,9 @@ def analyze_request(
     if CMD_INJECTION_PATTERNS.search(haystack):
         tags.append("cmd_injection_pattern")
         score += 60
+    if URL_IOC_RE.search(haystack) or C2_ENDPOINT_RE.search(haystack):
+        tags.append("ioc_present")
+        score += 35
     if method.upper() in ("POST", "PUT", "PATCH") and body_read_len > 0:
         tags.append("has_payload")
         score += 15
@@ -181,8 +300,13 @@ def analyze_request(
         category = "crawler"
     elif is_empty_get_root and score == 0:
         category = "benign_probe"
-    elif "cmd_injection_pattern" in tags or "cred_or_env_probe" in tags:
+    elif any(
+        t in tags
+        for t in ("nextjs_rce", "log4shell", "cmd_injection_pattern", "cred_or_env_probe", "ioc_present")
+    ):
         category = "high_interest_attack"
+    elif is_open_proxy:
+        category = "proxy_probe"
     else:
         category = "http_probe"
 
@@ -217,7 +341,6 @@ def read_request_body(rfile, headers) -> tuple[bytes, int | None, str | None]:
                     data = rfile.read(to_read)
                     chunks.append(data)
                     total += len(data)
-                # 残りチャンク分と末尾CRLFを消費してストリームを揃える
                 rem_discard = max(0, chunk_size - max(0, to_read)) + 2
                 while rem_discard > 0:
                     skip = rfile.read(min(rem_discard, 4096))
@@ -262,8 +385,8 @@ def read_request_body(rfile, headers) -> tuple[bytes, int | None, str | None]:
 
 
 class HoneypotHandler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.0"
-    server_version = "nginx/1.24.0"
+    protocol_version = "HTTP/1.1"
+    server_version = "Boa/0.94.14rc21"
     sys_version = ""
 
     def setup(self):
@@ -285,7 +408,9 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
             return int(srv_addr[1])
         return 0
 
-    def _send_response_bytes(self, code: int, body: bytes, content_type: str = "text/html; charset=utf-8") -> None:
+    def _send_response_bytes(
+        self, code: int, body: bytes, content_type: str = "text/html; charset=utf-8"
+    ) -> None:
         try:
             self.send_response(code)
             self.send_header("Server", self.server_version)
@@ -298,20 +423,59 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def _send_decoy_response(self, path: str) -> None:
+    # ==========================================
+    # 偽装レスポンス
+    # ==========================================
+    def _send_decoy_response(self, path: str, body_text: str, headers_clean: dict) -> None:
         if HP_MODE == "simple":
-            body = b"" if self.command == "HEAD" else HTML_BODY
+            body = b"" if self.command == "HEAD" else ROUTER_LOGIN_HTML
             self._send_response_bytes(200, body)
             return
 
         p_lower = path.lower()
-        if any(tok in p_lower for tok in (".env", "wp-config", ".git")):
+        decoded_both = f"{unquote(p_lower)} {unquote(body_text.lower())}"
+        next_action = get_first_header(headers_clean, "Next-Action")
+
+        # 1. Next-Action ヘッダ検出時に Next.js 風の text/x-component レスポンスを返答
+        if next_action:
+            rsc_body = (
+                b'0:{"a":"$@1","f":"","b":"development"}\n'
+                b'1:"$undefined"\n'
+            )
+            body = b"" if self.command == "HEAD" else rsc_body
+            self._send_response_bytes(200, body, "text/x-component; charset=utf-8")
+            return
+
+        # 2. /.env ファイルへのアクセスに対してダミーの認証情報・DB設定を返答
+        if "/.env" in p_lower or p_lower.endswith(".env"):
+            body = b"" if self.command == "HEAD" else FAKE_ENV_BODY
+            self._send_response_bytes(200, body, "text/plain; charset=utf-8")
+            return
+
+        # 3. /boaform/ へのアクセスに対し、ログイン／コマンド実行成功を偽装したHTMLを返答
+        if "/boaform/" in p_lower:
+            body = b"" if self.command == "HEAD" else BOA_DECOY_HTML
+            self._send_response_bytes(200, body, "text/html; charset=utf-8")
+            return
+
+        # 4. その他のコマンド注入兆候・HNAP・ルーター画面・404
+        if CMD_INJECTION_PATTERNS.search(decoded_both):
+            out = b"Linux router 4.4.198 #1 SMP mips GNU/Linux\r\n# "
+            body = b"" if self.command == "HEAD" else out
+            self._send_response_bytes(200, body, "text/plain; charset=utf-8")
+            return
+
+        if "/hnap1" in p_lower:
+            body = b"" if self.command == "HEAD" else HNAP_XML_BODY
+            self._send_response_bytes(200, body, "text/xml; charset=utf-8")
+            return
+
+        if any(tok in p_lower for tok in ("wp-config", ".git")):
             self._send_response_bytes(404, b"Not Found\n", "text/plain; charset=utf-8")
-        elif any(tok in p_lower for tok in ("admin", "login", "manager", "console")):
-            self._send_response_bytes(401, b"Unauthorized\n", "text/plain; charset=utf-8")
-        else:
-            body = b"" if self.command == "HEAD" else HTML_BODY
-            self._send_response_bytes(200, body)
+            return
+
+        body = b"" if self.command == "HEAD" else ROUTER_LOGIN_HTML
+        self._send_response_bytes(200, body, "text/html; charset=utf-8")
 
     def parse_request(self) -> bool:
         src_ip, src_port = self._client_addr()
@@ -324,7 +488,8 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
         ua = get_first_header(headers_clean, "User-Agent")
 
         if not ok:
-            analysis = analyze_request("", "", ua, "", 0, raw_ascii)
+            analysis = analyze_request("", "", ua, "", 0, headers_clean, raw_ascii)
+            ioc_info = extract_iocs("", raw_ascii, headers_clean)
             emit_log({
                 "event": "bad_request",
                 "src_ip": src_ip,
@@ -334,14 +499,15 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
                 "raw_request_line": raw_ascii,
                 "headers": headers_clean,
                 **analysis,
+                **ioc_info,
             })
             return False
 
         method = getattr(self, "command", "")
         if method not in ALLOWED_METHODS:
-            analysis = analyze_request(
-                method, getattr(self, "path", "") or "", ua, "", 0, raw_ascii
-            )
+            req_path = getattr(self, "path", "") or ""
+            analysis = analyze_request(method, req_path, ua, "", 0, headers_clean, raw_ascii)
+            ioc_info = extract_iocs(req_path, raw_ascii, headers_clean)
             emit_log({
                 "event": "bad_request",
                 "src_ip": src_ip,
@@ -351,6 +517,7 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
                 "raw_request_line": raw_ascii,
                 "headers": headers_clean,
                 **analysis,
+                **ioc_info,
             })
             self._send_response_bytes(501, b"Not Implemented\n", "text/plain; charset=utf-8")
             return False
@@ -377,7 +544,9 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
             user_agent=ua,
             body_text=body_text,
             body_read_len=len(read_bytes),
+            headers_clean=headers_clean,
         )
+        ioc_info = extract_iocs(path, body_text, headers_clean)
 
         emit_log({
             "event": "request",
@@ -396,9 +565,10 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
             "body": body_text,
             "read_error": read_error,
             **analysis,
+            **ioc_info,
         })
 
-        self._send_decoy_response(path)
+        self._send_decoy_response(path, body_text, headers_clean)
 
     def do_GET(self): self._handle_any()
     def do_HEAD(self): self._handle_any()
@@ -411,6 +581,9 @@ class HoneypotHandler(http.server.BaseHTTPRequestHandler):
     def do_CONNECT(self): self._handle_any()
 
 
+# ==========================================
+# HTTPサーバーとコネクション制御
+# ==========================================
 class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -442,6 +615,8 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
                 "traffic_category": "http_probe",
                 "attack_tags": ["rate_or_conn_limit"],
                 "suspicion_score": 10,
+                "iocs": {"urls": [], "c2_endpoints": [], "ips": [], "commands": []},
+                "has_ioc": False,
             })
             try:
                 sock.sendall(b"HTTP/1.0 503 Service Unavailable\r\nConnection: close\r\n\r\n")
