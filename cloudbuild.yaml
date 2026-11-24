@@ -1,26 +1,27 @@
 steps:
-- name: 'gcr.io/cloud-builders/docker'
-args:
-  - 'build'
-  - '-t'
-  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
-  - '.'
-- name: 'gcr.io/cloud-builders/docker'
-args:
-  - 'push'
-  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
-- name: 'gcr.io/cloud-builders/docker'
-args:
-  - 'build'
-  - '-f'
-  - 'nginx/Dockerfile'
-  - '-t'
-  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
-  - 'nginx'
-- name: 'gcr.io/cloud-builders/docker'
-args:
-  - 'push'
-  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
+      - '.'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'nginx/Dockerfile'
+      - '-t'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+      - 'nginx'
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+
 images:
-- 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
-- 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
+  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
