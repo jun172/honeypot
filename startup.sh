@@ -43,8 +43,10 @@ iptables -C DOCKER-USER -s 172.17.0.0/16 -j DROP 2>/dev/null || \
   iptables -A DOCKER-USER -s 172.17.0.0/16 -j DROP
 
 # ==============================================================================
-# 2. Dockerコンテナの起動（多層防御・サンドボックス化）
+# 2. Dockerコンテナの起動（COS対応：書き込み可能な /tmp/.docker を使用）
 # ==============================================================================
+export DOCKER_CONFIG=/tmp/.docker
+mkdir -p "$DOCKER_CONFIG"
 /usr/bin/docker-credential-gcr configure-docker --registries=asia-northeast1-docker.pkg.dev
 
 docker rm -f honeypot hp-nginx 2>/dev/null || true
@@ -71,3 +73,6 @@ docker run -d \
   "${PORT_ARGS[@]}" \
   --log-driver=gcplogs \
   "$IMAGE_URI"
+
+echo "=== 起動完了：現在のコンテナ状態 ==="
+docker ps
