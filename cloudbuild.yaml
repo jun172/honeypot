@@ -7,10 +7,12 @@ steps:
       - '-t'
       - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
       - '.'
+
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
       - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
+
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
@@ -19,10 +21,25 @@ steps:
       - '-t'
       - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
       - 'nginx'
+
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
       - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+
+  # ★ポートを開けずにVMのスタートアップスクリプトを更新し、VMをリセットして最新版を自動適用
+  - name: 'gcr.io/://google.com'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud compute instances add-metadata hp-vm-us-01 \
+          --zone=us-central1-a \
+          --project=honeypot-515503 \
+          --metadata-from-file startup-script=startup.sh
+        gcloud compute instances reset hp-vm-us-01 \
+          --zone=us-central1-a \
+          --project=honeypot-515503
 
 images:
   - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'

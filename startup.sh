@@ -2,18 +2,20 @@
 set -euo pipefail
 
 # ==============================================================================
-# 世界の攻撃ボット・スキャナーが狙う主要45ポート（Web / 管理画面 / Proxy / DB / IoT系）
+# 世界の攻撃ボット・スキャナーが狙う主要ポート（Web / 管理画面 / Proxy / DB / IoT / 監視系）
 # ※注意: 管理用SSH（22番または22222番）は絶対にここに入れないこと！
 # ==============================================================================
 PORTS=(
   # --- 標準・代替HTTP / HTTPS / Proxy系 ---
-  80 81 82 83 88 443 591 8000 8001 8008 8080 8081 8082 8088 8090 8181 8443 8880 8888 9000 9001 9080 9090 9443 10000
+  80 81 82 83 84 85 88 89 443 591 8000 8001 8002 8008 8080 8081 8082 8083 8084 8085 8088 8090 8091 8180 8181 8443 8800 8880 8888 9000 9001 9002 9080 9090 9091 9443 10000 10443
   # --- プロキシ・踏み台悪用探索系 ---
-  1080 3128 8118 8123
+  1080 3128 8118 8123 9050
   # --- 開発フレームワーク・管理パネル（Node / Python / Java / Docker / K8s） ---
-  2375 3000 3001 4000 4200 4567 5000 5001 5601 7001 7002 9200
+  2375 2376 3000 3001 3002 4000 4200 4567 4848 5000 5001 5005 5601 7001 7002 8069 8200 9092 9200 9300 15672
+  # --- DB / キャッシュ / ストレージ管理UI探索系 ---
+  3306 5432 5984 6379 8086 9042 27017
   # --- IoT・ルーター・カメラ・産業機器のWeb管理UI系 ---
-  8089 8291 8728 37777
+  554 7547 8089 8291 8728 8729 9527 37777 50000
 )
 
 IMAGE_URI="asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest"
@@ -49,6 +51,9 @@ export DOCKER_CONFIG=/tmp/.docker
 mkdir -p "$DOCKER_CONFIG"
 /usr/bin/docker-credential-gcr configure-docker --registries=asia-northeast1-docker.pkg.dev
 
+# ★再起動時に必ず最新の :latest イメージを取得する
+docker pull "$IMAGE_URI"
+
 docker rm -f honeypot hp-nginx 2>/dev/null || true
 
 PORT_ARGS=()
@@ -76,7 +81,10 @@ docker run -d \
 
 echo "=== 起動完了：現在のコンテナ状態 ==="
 docker ps
-# （startup.sh の末尾に追加）
+
+# ==============================================================================
+# 3. パケット録画（tcpdump）＆ GCS自動バックアップ
+# ==============================================================================
 mkdir -p /tmp/pcap
 docker rm -f hp-pcap hp-pcap-sync 2>/dev/null || true
 
@@ -92,7 +100,7 @@ docker run -d \
   nicolaka/netshoot \
   tcpdump -i any -nn -s 0 "tcp and not port 22" -C 10 -W 10 -w /pcap/capture.pcap
 
-# 2. 5分ごとに溜まったpcapをGCSへ自動アップロード＆ローカル削除する軽量コンテナ
+# 2. 溜まったpcapをGCSへ自動アップロード＆ローカル削除する軽量コンテナ
 docker run -d \
   --name hp-pcap-sync \
   --restart unless-stopped \
