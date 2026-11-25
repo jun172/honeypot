@@ -16,7 +16,7 @@ PORTS=(
   8089 8291 8728 37777
 )
 
-IMAGE_URI="asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http@sha256:a886cad31be4612b23118072841f32e4d8e5885728f16d6c7f079b4f23c9ec12"
+IMAGE_URI="asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest"
 
 # ==============================================================================
 # 1. ネットワーク（iptables）のガチガチ防御
@@ -76,3 +76,26 @@ docker run -d \
 
 echo "=== 起動完了：現在のコンテナ状態 ==="
 docker ps
+# （startup.sh の末尾に追加）
+mkdir -p /tmp/pcap
+docker rm -f hp-pcap hp-pcap-sync 2>/dev/null || true
+
+# 1. パケット録画コンテナ（22番以外のTCPを10MBごとに保存）
+docker run -d \
+  --name hp-pcap \
+  --restart unless-stopped \
+  --net=host \
+  --cap-drop=ALL \
+  --cap-add=NET_RAW \
+  --cap-add=NET_ADMIN \
+  -v /tmp/pcap:/pcap \
+  nicolaka/netshoot \
+  tcpdump -i any -nn -s 0 "tcp and not port 22" -C 10 -W 10 -w /pcap/capture.pcap
+
+# 2. 5分ごとに溜まったpcapをGCSへ自動アップロード＆ローカル削除する軽量コンテナ
+docker run -d \
+  --name hp-pcap-sync \
+  --restart unless-stopped \
+  -v /tmp/pcap:/pcap \
+  google/cloud-sdk:slim \
+  bash -c 'while true; do sleep 604800; for f in /pcap/capture.pcap*; do [ -f "$f" ] && gcloud storage cp "$f" gs://honeypot-archive-515503/pcap/$(hostname)_$(date +%Y%m%d_%H%M%S)_$(basename "$f") && rm -f "$f"; done; done'

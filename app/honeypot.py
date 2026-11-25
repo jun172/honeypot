@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
 """
-Medium-Interaction Blog + IoT Portal Honeypot (Standard Library Only).
+Expanded Medium-Interaction Blog + IoT + Web Decoy Honeypot (Standard Library Only).
 
-Simulates a multi-layer decoy portal combining:
-- Blog & public discovery routes (/, /blog, /feed.xml, /rss.xml, /sitemap.xml,
-  /robots.txt, /category/tech, /category/iot, /articles/101)
-- Auth & account routes (/login, /logout, /register, /signup, /password/reset,
-  /boaform/admin/formLogin, /wp-login.php)
-- Content & admin routes (/posts/new, /posts/list, /admin, /admin/dashboard,
-  /admin/posts)
-- IoT gateway management routes (/iot/admin, /iot/status, /iot/network,
-  /iot/wifi, /iot/firmware, /cgi-bin/luci)
-- API, config & recon decoy routes (/api/v1/status, /api/v1/posts,
-  /api/v1/auth/login, /api/v1/device/status, /api/v1/device/config, /.env,
-  /config.json, /backup.zip, /server-status, /actuator, /actuator/env)
-
-All state stays in memory and structured JSON events are emitted to stdout.
-No real files are written, no external network calls are made, and no OS
-commands or dynamic code evaluation (subprocess / os.system / eval) are used.
+Simulates a multi-layer decoy portal in memory and emits structured JSON events
+to stdout. No real files are written, no external network calls are made, and no
+OS commands or dynamic code evaluation (subprocess / os.system / eval) are used.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
 import hashlib
@@ -49,14 +37,108 @@ _PROXY_INTERNAL_HEADERS: frozenset[str] = frozenset(
 
 _URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+", re.IGNORECASE)
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_DOMAIN_RE = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b", re.IGNORECASE)
+_DOMAIN_RE = re.compile(
+    r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b",
+    re.IGNORECASE,
+)
 _B64_RE = re.compile(r"\b[A-Za-z0-9+/]{16,}={0,2}\b")
+_HEX_RE = re.compile(r"(?:\\x[0-9a-fA-F]{2}){4,}|\b[0-9a-fA-F]{24,}\b")
 
-_ATTACK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("sqli_pattern", re.compile(r"(?:\bunion\b\s+\bselect\b|\bor\b\s+1\s*=\s*1|--\s|/\*.*\*/)", re.IGNORECASE)),
-    ("xss_pattern", re.compile(r"(?:<script\b|javascript:|onerror\s*=|onload\s*=)", re.IGNORECASE)),
-    ("path_traversal", re.compile(r"(?:\.\./|\.\.\\|%2e%2e%2f)", re.IGNORECASE)),
-    ("cmd_injection_terms", re.compile(r"(?:\bwget\b|\bcurl\b|\bchmod\b|\b/bin/sh\b|\b/bin/bash\b|;\s*id\b)", re.IGNORECASE)),
+_ECHO_RE = re.compile(
+    r"""(?:^|[\s;|&`(])(?:echo|printf)\s+(?:-[neE]+\s+)?["']?([A-Za-z0-9_./:-]{1,120})["']?""",
+    re.IGNORECASE,
+)
+_PHP_ECHO_RE = re.compile(
+    r"""(?:echo|print)\s*\(?\s*["']([A-Za-z0-9_./:-]{1,120})["']\s*\)?""",
+    re.IGNORECASE,
+)
+
+_TECHNIQUE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "rce_cmd_injection",
+        re.compile(
+            r"(?:\bwget\b|\bcurl\b|\bchmod\b|\b/bin/sh\b|\b/bin/bash\b|\bnc\b|\bnetcat\b|\bwhoami\b|\buname\b|;\s*(?:id|sh|bash|wget|curl)\b|\$\([^)]+\)|`[^`]+`)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "log4j_jndi",
+        re.compile(r"\$\{\s*jndi\s*:(?:ldap|ldaps|rmi|dns|iiop)s?://", re.IGNORECASE),
+    ),
+    (
+        "shellshock",
+        re.compile(r"\(\)\s*\{[^}]*\}\s*;?", re.IGNORECASE),
+    ),
+    (
+        "sqli",
+        re.compile(
+            r"(?:\bunion\b(?:\s+all)?\s+\bselect\b|\bor\b\s+1\s*=\s*1|\band\b\s+1\s*=\s*1|\bsleep\s*\(|\bbenchmark\s*\(|\bextractvalue\s*\(|\bupdatexml\s*\(|--\s|/\*[\s\S]*?\*/)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "xss",
+        re.compile(
+            r"(?:<script\b|javascript:|onerror\s*=|onload\s*=|onmouseover\s*=|document\.cookie|<svg\b|<iframe\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "path_traversal",
+        re.compile(
+            r"(?:\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|\.\.%2f|%2e%2e%5c|/etc/passwd|/etc/shadow|/proc/self/environ)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "ssrf_cloud_metadata",
+        re.compile(
+            r"(?:169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|fd00:ec2::254|/latest/meta-data/)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "php_eval_rce",
+        re.compile(
+            r"(?:<\?php|eval\s*\(|assert\s*\(|system\s*\(|passthru\s*\(|shell_exec\s*\(|proc_open\s*\(|popen\s*\(|base64_decode\s*\(|eval-stdin\.php)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "thinkphp_rce",
+        re.compile(
+            r"(?:\\think\\app|\\think\\container|invokefunction|call_user_func_array|s=/index/\think)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "spring_spel_rce",
+        re.compile(
+            r"(?:/actuator(?:/env|/heapdump|/jolokia|/gatewayroutes)?|\bT\s*\(\s*java\.lang\.Runtime\b|ProcessBuilder)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "deserialization",
+        re.compile(
+            r"(?:rO0AB|aced0005|O:\d+:\"[A-Za-z0-9_\\]+\":\d+:\{|__wakeup|__destruct|java\.io\.ObjectInputStream|ysoserial)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "credential_stuffing",
+        re.compile(
+            r"(?:/wp-login\.php|/xmlrpc\.php|/boaform/admin/formLogin|/api/v1/auth/login|\b(?:admin|root|guest|test|user)\b.*(?:password|passwd|pwd|token))",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "scanner_recon",
+        re.compile(
+            r"(?:/\.env|/config\.json|/backup\.zip|/server-status|/wp-admin/admin-ajax\.php|/script\b|sqlmap|nikto|masscan|zgrab|nuclei|dirbuster|gobuster)",
+            re.IGNORECASE,
+        ),
+    ),
 ]
 
 
@@ -94,17 +176,97 @@ def _classify_ip(ip_str: str) -> tuple[bool, str]:
 def _decode_base64_candidates(text: str) -> list[str]:
     """Safely attempt base64 decoding and keep printable strings."""
     out: list[str] = []
-    for token in _B64_RE.findall(text)[:10]:
+    seen: set[str] = set()
+    for token in _B64_RE.findall(text)[:25]:
         padded = token + ("=" * ((4 - len(token) % 4) % 4))
         try:
             raw = base64.b64decode(padded, validate=False)
             decoded = raw.decode("utf-8", errors="ignore").strip()
             printable = "".join(ch for ch in decoded if ch.isprintable() or ch in "\r\n\t")
-            if len(printable) >= 4:
-                out.append(printable[:200])
+            clipped = printable[:2000]
+            if len(printable) >= 4 and clipped not in seen:
+                seen.add(clipped)
+                out.append(clipped)
         except Exception:
             continue
     return out
+
+
+def _decode_hex_candidates(text: str) -> list[str]:
+    """Safely attempt hex decoding and keep printable strings."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for match in _HEX_RE.findall(text)[:20]:
+        cleaned = match.replace("\\x", "").replace("0x", "")
+        if len(cleaned) < 8 or len(cleaned) % 2 != 0:
+            continue
+        try:
+            raw = binascii.unhexlify(cleaned)
+            decoded = raw.decode("utf-8", errors="ignore").strip()
+            printable = "".join(ch for ch in decoded if ch.isprintable() or ch in "\r\n\t")
+            clipped = printable[:2000]
+            if len(printable) >= 4 and clipped not in seen:
+                seen.add(clipped)
+                out.append(clipped)
+        except Exception:
+            continue
+    return out
+
+
+def extract_echo_token(text: str) -> str | None:
+    """Extract a safe marker token from echo/printf probe strings."""
+    for rx in (_ECHO_RE, _PHP_ECHO_RE):
+        m = rx.search(text)
+        if m:
+            tok = m.group(1).strip()
+            if tok:
+                return tok[:120]
+    return None
+
+
+class VirtualAttackEmulator:
+    """In-memory virtual files and decoy responses without OS or network side effects."""
+
+    def __init__(self) -> None:
+        self.passwd_decoy = "\n".join(
+            [
+                "root:x:0:0:root:/root:/bin/bash",
+                "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin",
+                "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin",
+                "appuser:x:1000:1000:App User:/home/appuser:/bin/bash",
+                "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin",
+            ]
+        )
+        self.laravel_env_decoy = "\n".join(
+            [
+                "# SIMULATED HONEYPOT ENV DECOY",
+                "APP_NAME=PortalDecoy",
+                "APP_ENV=staging-sim",
+                "APP_DEBUG=true",
+                "DB_CONNECTION=mysql",
+                "DB_HOST=127.0.0.1",
+                "DB_PORT=3306",
+                "DB_DATABASE=portal_decoy_db",
+                "DB_USERNAME=decoy_db_user",
+                "DB_PASSWORD=SIMULATED_DECOY_DB_PASS_0001",
+                "AWS_ACCESS_KEY_ID=AKIASIMULATED00000001",
+                "AWS_SECRET_ACCESS_KEY=SIMULATED_DECOY_AWS_SECRET_0001",
+                "AWS_DEFAULT_REGION=ap-northeast-1",
+            ]
+        )
+        self.actuator_env_decoy: dict[str, Any] = {
+            "activeProfiles": ["simulation"],
+            "propertySources": [
+                {
+                    "name": "simulatedConfigService",
+                    "properties": {
+                        "spring.datasource.url": {"value": "jdbc:mysql://127.0.0.1:3306/sim_app"},
+                        "spring.datasource.username": {"value": "sim_spring_user"},
+                        "spring.datasource.password": {"value": "SIMULATED_SPRING_SECRET_0001"},
+                    },
+                }
+            ],
+        }
 
 
 class HttpFingerprinter:
@@ -191,8 +353,8 @@ class HttpFingerprinter:
         }
 
 
-class PayloadOsintEngine:
-    """Extract payload IOC candidates and match against local in-memory OSINT sets."""
+class ThreatIntelEngine:
+    """Extract IOCs, decode Base64/Hex/URL strings, and tag 13 attack techniques."""
 
     def __init__(self) -> None:
         self.known_bad_ips: set[str] = {"198.51.100.66", "203.0.113.77"}
@@ -210,29 +372,39 @@ class PayloadOsintEngine:
             "gobuster",
             "curl/",
             "python-requests",
+            "wget",
         ]
 
     def analyze(
         self,
         client_ip: str,
         user_agent: str,
+        raw_path: str,
         raw_query: str,
+        raw_headers: list[tuple[str, str]],
         payload_dict: dict[str, Any],
     ) -> dict[str, Any]:
-        """Extract C2 candidate indicators and correlate with local OSINT sets."""
+        """Scan path, query, headers, and payload (with URL/Base64/Hex decoding)."""
         parts: list[str] = []
+        if raw_path:
+            parts.append(f"path={unquote(raw_path)}")
         if raw_query:
-            parts.append(unquote(raw_query))
-        for k, v in list(payload_dict.items())[:30]:
+            parts.append(f"query={unquote(raw_query)}")
+        for k, v in list(raw_headers)[:40]:
+            parts.append(f"header:{k}={unquote(str(v))}")
+        for k, v in list(payload_dict.items())[:50]:
             parts.append(f"{k}={v}")
-        raw_text = unquote("\n".join(parts))[:8000]
 
+        raw_text = unquote("\n".join(parts))[:16000]
         decoded_b64 = _decode_base64_candidates(raw_text)
-        corpus = raw_text + ("\n" + "\n".join(decoded_b64) if decoded_b64 else "")
+        decoded_hex = _decode_hex_candidates(raw_text)
 
-        urls = list(dict.fromkeys(_URL_RE.findall(corpus)))[:20]
-        raw_ips = list(dict.fromkeys(_IPV4_RE.findall(corpus)))[:20]
-        domains = list(dict.fromkeys(d.lower() for d in _DOMAIN_RE.findall(corpus)))[:20]
+        extra_blocks = decoded_b64 + decoded_hex
+        corpus = raw_text + ("\n" + "\n".join(extra_blocks) if extra_blocks else "")
+
+        captured_urls = list(dict.fromkeys(_URL_RE.findall(corpus)))[:30]
+        raw_ips = list(dict.fromkeys(_IPV4_RE.findall(corpus)))[:30]
+        domains = list(dict.fromkeys(d.lower() for d in _DOMAIN_RE.findall(corpus)))[:30]
 
         ip_items: list[dict[str, Any]] = []
         for ip_cand in raw_ips:
@@ -247,8 +419,8 @@ class PayloadOsintEngine:
             )
 
         matched_domains = [d for d in domains if d in self.known_bad_domains]
-        matched_urls = [u for u in urls if any(bad in u.lower() for bad in self.known_bad_domains)]
-        patterns = [tag for tag, rx in _ATTACK_PATTERNS if rx.search(corpus)]
+        matched_urls = [u for u in captured_urls if any(bad in u.lower() for bad in self.known_bad_domains)]
+        techniques = [tag for tag, rx in _TECHNIQUE_PATTERNS if rx.search(corpus)]
         ua_hints = [t for t in self.known_tools if t in user_agent.lower()]
 
         client_pub, client_scope = _classify_ip(client_ip)
@@ -267,12 +439,17 @@ class PayloadOsintEngine:
             "client_ip_scope": client_scope,
             "client_ip_public": client_pub,
             "ua_tool_hints": ua_hints,
-            "attack_patterns": patterns,
+            "attack_techniques": techniques,
+            "attack_patterns": techniques,
+            "captured_attacker_urls": captured_urls,
+            "decoded_base64_texts": decoded_b64,
+            "decoded_hex_texts": decoded_hex,
             "c2_candidates": {
-                "urls": urls,
+                "urls": captured_urls,
                 "ips": ip_items,
                 "domains": domains,
                 "decoded_base64_count": len(decoded_b64),
+                "decoded_hex_count": len(decoded_hex),
             },
             "osint_correlation": {
                 "mode": "local_in_memory_only",
@@ -282,8 +459,8 @@ class PayloadOsintEngine:
         }
 
 
-class BlogIoTPortalState:
-    """Thread-safe in-memory state for Medium-Interaction Blog + IoT Portal."""
+class HoneypotState:
+    """Thread-safe in-memory state for the expanded Honeypot."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -291,9 +468,12 @@ class BlogIoTPortalState:
         self.events: deque[dict[str, Any]] = deque(maxlen=5000)
         self.path_hits: Counter[str] = Counter()
         self.ip_hits: Counter[str] = Counter()
+        self.url_hits: Counter[str] = Counter()
+        self.technique_hits: Counter[str] = Counter()
         self.failed_logins_by_ip: defaultdict[str, int] = defaultdict(int)
         self.fingerprinter = HttpFingerprinter()
-        self.osint_engine = PayloadOsintEngine()
+        self.threat_intel_engine = ThreatIntelEngine()
+        self.emulator = VirtualAttackEmulator()
 
         self.users: dict[str, dict[str, str]] = {
             "admin": {"password_hash": sha256_short("PortalAdmin#2026"), "role": "admin"},
@@ -353,32 +533,33 @@ class BlogIoTPortalState:
             "remote_management": {"ssh_enabled": False, "web_admin_port": 8443},
         }
 
-        self.dotenv_decoy = "\n".join(
-            [
-                "# BLOG & IOT PORTAL CONFIG (SIMULATED)",
-                "APP_ENV=portal-sim",
-                "DB_HOST=127.0.0.1",
-                "DB_PORT=5432",
-                "DB_NAME=portal_sim_db",
-                "DB_USER=portal_sim_user",
-                "DB_PASSWORD=SIMULATED_NON_PROD_SECRET_0001",
-                "IOT_API_KEY=SIMULATED_NON_PROD_KEY_0001",
-            ]
-        )
+        self.dotenv_decoy = self.emulator.laravel_env_decoy
         self.config_json_decoy: dict[str, Any] = {
             "service": "blog-iot-portal",
             "environment": "simulation",
             "endpoints": {"blog": "/blog", "api": "/api/v1/status", "device": "/api/v1/device/status"},
-            "device": {"model": self.device_config["device_model"], "firmware": self.device_config["firmware_version"]},
+            "device": {
+                "model": self.device_config["device_model"],
+                "firmware": self.device_config["firmware_version"],
+            },
         }
 
     def record_event(self, event: dict[str, Any]) -> None:
         """Append event to in-memory ring buffer and emit structured JSON to stdout."""
         enriched = {"timestamp": utc_now_iso(), **event}
+        intel = enriched.get("threat_intel") or {}
+        urls = intel.get("captured_attacker_urls") or []
+        techs = intel.get("attack_techniques") or []
+
         with self.lock:
             self.events.append(enriched)
             self.path_hits[str(enriched.get("path", ""))] += 1
             self.ip_hits[str(enriched.get("client_ip", "unknown"))] += 1
+            for u in urls:
+                self.url_hits[str(u)] += 1
+            for t in techs:
+                self.technique_hits[str(t)] += 1
+
         print(json.dumps(enriched, ensure_ascii=True), flush=True)
 
     def create_session(self, username: str, role: str) -> str:
@@ -434,7 +615,7 @@ class BlogIoTPortalState:
             self.next_article_id += 1
             self.articles.insert(0, art)
             return dict(art)
-        
+
     def update_device_config(self, updates: dict[str, Any]) -> dict[str, Any]:
         """Update whitelisted fields of the synthetic IoT gateway config in memory."""
         with self.lock:
@@ -466,6 +647,8 @@ class BlogIoTPortalState:
                 "unique_ips": len(self.ip_hits),
                 "top_paths": self.path_hits.most_common(15),
                 "top_ips": self.ip_hits.most_common(10),
+                "top_captured_urls": self.url_hits.most_common(20),
+                "attack_techniques_breakdown": dict(self.technique_hits.most_common()),
                 "failed_login_ips": dict(self.failed_logins_by_ip),
                 "articles_count": len(self.articles),
                 "active_sessions": len(self.sessions),
@@ -538,10 +721,10 @@ def render_html(title: str, body_html: str, session_user: str | None = None) -> 
     return doc.encode("utf-8")
 
 
-class BlogIoTPortalHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the Medium-Interaction Blog + IoT Portal honeypot."""
+class HoneypotHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the expanded Medium-Interaction Blog + IoT + Web Decoy honeypot."""
 
-    state: BlogIoTPortalState
+    state: HoneypotState
     server_version = "PortalHTTP/2.4"
     sys_version = ""
 
@@ -590,7 +773,7 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
             length = int(raw_len)
         except ValueError:
             return b"", "Invalid Content-Length"
-        if length < 0 or length > 65536:
+        if length < 0 or length > 262144:
             return b"", "Payload length out of range"
         return self.rfile.read(length), None
 
@@ -604,19 +787,29 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                 parsed = json.loads(text)
                 return parsed if isinstance(parsed, dict) else {"_json": parsed}
             except json.JSONDecodeError:
-                return {"_malformed_json": text[:300]}
+                return {"_malformed_json": text[:4000]}
         qs = parse_qs(text, keep_blank_values=True)
-        return {k: v[0] if len(v) == 1 else v for k, v in qs.items()}
+        out: dict[str, Any] = {}
+        for k, v in qs.items():
+            out[k] = v[0] if len(v) == 1 else v
+        if not out and text.strip():
+            out["_raw_body"] = text[:4000]
+        return out
 
     def _summarize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Summarize payload fields up to 4000 characters while redacting secrets."""
         summary: dict[str, Any] = {}
-        for k, v in list(payload.items())[:20]:
-            key = str(k)[:50]
+        for k, v in list(payload.items())[:30]:
+            key = str(k)[:100]
             if any(word in key.lower() for word in ("pass", "secret", "token", "key", "pwd")):
                 val = str(v)
-                summary[key] = {"redacted": True, "length": len(val), "sha256_prefix": sha256_short(val, 8)}
+                summary[key] = {
+                    "redacted": True,
+                    "length": len(val),
+                    "sha256_prefix": sha256_short(val, 8),
+                }
             else:
-                summary[key] = str(v)[:160]
+                summary[key] = str(v)[:4000]
         return summary
 
     def _send_raw(
@@ -672,29 +865,34 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
         client_ip = self._client_ip()
         ua = self.headers.get("User-Agent", "")
         sess = self._session()
+        raw_headers_list = list(self.headers.items())
         fp_data = self.state.fingerprinter.fingerprint(
             client_ip=client_ip,
             method=self.command,
             path=parsed.path,
-            raw_headers=list(self.headers.items()),
+            raw_headers=raw_headers_list,
             arrival_monotonic=time.monotonic(),
         )
-        intel_data = self.state.osint_engine.analyze(
+        intel_data = self.state.threat_intel_engine.analyze(
             client_ip=client_ip,
             user_agent=ua,
+            raw_path=self.path,
             raw_query=parsed.query,
+            raw_headers=raw_headers_list,
             payload_dict=payload_dict or {},
         )
+        effective_outcome = "stage2_url_captured" if intel_data.get("captured_attacker_urls") else outcome
+
         self.state.record_event(
             {
                 "event_type": "http_request",
                 "client_ip": client_ip,
                 "method": self.command,
                 "path": parsed.path,
-                "query": parsed.query[:300],
+                "query": parsed.query[:1000],
                 "status_code": status_code,
-                "outcome": outcome,
-                "user_agent": ua[:250],
+                "outcome": effective_outcome,
+                "user_agent": ua[:400],
                 "session_user": sess["username"] if sess else None,
                 "payload": payload_summary or {},
                 "comm_fingerprint": fp_data,
@@ -715,7 +913,11 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
         self._dispatch(allow_body=True)
 
     def do_DELETE(self) -> None:
-        self._send_json(405, {"error": "Method Not Allowed", "allowed": ["GET", "HEAD", "POST"]}, {"Allow": "GET, HEAD, POST"})
+        self._send_json(
+            405,
+            {"error": "Method Not Allowed", "allowed": ["GET", "HEAD", "POST", "PUT"]},
+            {"Allow": "GET, HEAD, POST, PUT"},
+        )
         self._log_event(405, "method_not_allowed")
 
     def _render_articles(self, items: list[dict[str, Any]]) -> str:
@@ -728,6 +930,11 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
             f"<div style='font-size:0.8rem;color:#64748b;'>[{html.escape(str(a['category']))}] by {html.escape(str(a['author']))} at {html.escape(str(a['published_at']))}</div></div>"
             for a in items
         )
+
+    def _combined_probe_text(self, parsed_path: str, parsed_query: str, payload: dict[str, Any]) -> str:
+        header_vals = " ".join(f"{k}:{v}" for k, v in self.headers.items())
+        body_vals = " ".join(f"{k}={v}" for k, v in payload.items())
+        return unquote(f"{parsed_path} {parsed_query} {header_vals} {body_vals}")
 
     def _dispatch(self, allow_body: bool) -> None:
         parsed = urlparse(self.path)
@@ -745,6 +952,69 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
 
         payload = self._parse_payload(raw_body) if raw_body else {}
         payload_summary = self._summarize_payload(payload) if payload else {}
+        probe_text = self._combined_probe_text(self.path, parsed.query, payload)
+
+        # 0. Web & framework decoys (Laravel/PHPUnit, path traversal, ThinkPHP, Spring, Jenkins, WordPress, SQLi bait)
+        if "phpunit" in path.lower() and path.lower().endswith("eval-stdin.php"):
+            token = extract_echo_token(probe_text) or "PHPUNIT_SIM_OK"
+            body = f"<?xml version='1.0'?>\n{token}\n".encode("utf-8")
+            self._send_raw(200, "text/plain; charset=utf-8", body, allow_body=allow_body)
+            self._log_event(200, "decoy_phpunit_eval_bait", payload, payload_summary)
+            return
+
+        if path.startswith("/cgi-bin/") or "etc/passwd" in unquote(self.path).lower() or "%2e%2e" in self.path.lower():
+            token = extract_echo_token(probe_text)
+            if token:
+                body = f"{self.state.emulator.passwd_decoy}\n{token}\n".encode("utf-8")
+            else:
+                body = (self.state.emulator.passwd_decoy + "\n").encode("utf-8")
+            self._send_raw(200, "text/plain; charset=utf-8", body, allow_body=allow_body)
+            self._log_event(200, "decoy_traversal_passwd_bait", payload, payload_summary)
+            return
+
+        if "think\\app" in unquote(self.path).lower() or "invokefunction" in probe_text.lower():
+            token = extract_echo_token(probe_text) or "THINKPHP_SIM_READY"
+            body = f"{token}\n".encode("utf-8")
+            self._send_raw(200, "text/plain; charset=utf-8", body, allow_body=allow_body)
+            self._log_event(200, "decoy_thinkphp_rce_bait", payload, payload_summary)
+            return
+
+        if path == "/script":
+            token = extract_echo_token(probe_text) or "Groovy 3.0.17-sim"
+            html_body = (
+                "<form method='POST' action='/script'>"
+                "<textarea name='script' rows='6'>println 'sim'</textarea>"
+                "<button type='submit'>Run</button></form>"
+                f"<pre>Result: {html.escape(token)}</pre>"
+            )
+            self._send_html(200, "Script Console", html_body, session_user, allow_body=allow_body)
+            self._log_event(200, "decoy_jenkins_script_bait", payload, payload_summary)
+            return
+
+        if path in {"/xmlrpc.php", "/wp-admin/admin-ajax.php"}:
+            token = extract_echo_token(probe_text)
+            if token:
+                self._send_raw(200, "text/xml; charset=utf-8", f"<methodResponse><params><param><value><string>{html.escape(token)}</string></value></param></params></methodResponse>".encode("utf-8"), allow_body=allow_body)
+            else:
+                self._send_raw(200, "text/xml; charset=utf-8", b"<?xml version='1.0'?><methodResponse><params><param><value><string>0</string></value></param></params></methodResponse>", allow_body=allow_body)
+            self._log_event(200, "decoy_wordpress_endpoint", payload, payload_summary)
+            return
+
+        if any(k in probe_text.lower() for k in ("union select", "1=1", "extractvalue(", "updatexml(", "sql syntax")):
+            err_doc = (
+                "<div class='error'>Database query error near SQL expression: "
+                "You have an error in your SQL syntax; check the manual that corresponds to your DB server version.</div>"
+            )
+            self._send_html(500, "500 Internal Server Error", err_doc, session_user, allow_body=allow_body)
+            self._log_event(500, "decoy_sqli_error_bait", payload, payload_summary)
+            return
+
+        # Echo / printf probe emulation across routes
+        echo_tok = extract_echo_token(probe_text)
+        if echo_tok and self.command in {"POST", "PUT"}:
+            self._send_raw(200, "text/plain; charset=utf-8", f"{echo_tok}\n".encode("utf-8"), allow_body=allow_body)
+            self._log_event(200, "echo_probe_bait", payload, payload_summary)
+            return
 
         # 1. Blog & discovery routes
         if path == "/robots.txt":
@@ -759,9 +1029,14 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/sitemap.xml":
-            locs = ["/", "/blog", "/category/tech", "/category/iot"] + [f"/articles/{a['id']}" for a in self.state.articles]
+            locs = ["/", "/blog", "/category/tech", "/category/iot"] + [
+                f"/articles/{a['id']}" for a in self.state.articles
+            ]
             body_xml = "\n".join(f"  <url><loc>{loc}</loc></url>" for loc in locs)
-            xml = f"<?xml version='1.0' encoding='UTF-8'?>\n<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>\n{body_xml}\n</urlset>\n".encode("utf-8")
+            xml = (
+                f"<?xml version='1.0' encoding='UTF-8'?>\n"
+                f"<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>\n{body_xml}\n</urlset>\n"
+            ).encode("utf-8")
             self._send_raw(200, "application/xml; charset=utf-8", xml, allow_body=allow_body)
             self._log_event(200, "sitemap_xml", payload, payload_summary)
             return
@@ -771,28 +1046,68 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                 f"  <item><title>{html.escape(str(a['title']))}</title><link>/articles/{a['id']}</link></item>"
                 for a in self.state.articles
             )
-            rss = f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>Portal Feed</title>\n{items_xml}\n</channel></rss>".encode("utf-8")
+            rss = (
+                f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>Portal Feed</title>\n"
+                f"{items_xml}\n</channel></rss>"
+            ).encode("utf-8")
             self._send_raw(200, "application/rss+xml; charset=utf-8", rss, allow_body=allow_body)
             self._log_event(200, "feed_xml", payload, payload_summary)
             return
 
         if path in {"/", "/blog", "/posts/list"}:
+            if self.command in {"POST", "PUT"}:
+                tok = echo_tok or "1;payload=/tmp/sim_action"
+                resp_body = f'0:["$@1",["development",null]]\n1:{{"status":"ok","output":{json.dumps(tok)}}}\n'.encode("utf-8")
+                self._send_raw(
+                    200,
+                    "text/x-component; charset=utf-8",
+                    resp_body,
+                    headers={"X-Action-Rebound": "1"},
+                    allow_body=allow_body,
+                )
+                self._log_event(200, "next_action_bait", payload, payload_summary)
+                return
             if self.command not in {"GET", "HEAD"}:
-                self._send_html(405, "405 Method Not Allowed", "<p>Use GET or HEAD.</p>", session_user, {"Allow": "GET, HEAD"}, allow_body)
+                self._send_html(
+                    405,
+                    "405 Method Not Allowed",
+                    "<p>Use GET or HEAD.</p>",
+                    session_user,
+                    {"Allow": "GET, HEAD, POST"},
+                    allow_body,
+                )
                 self._log_event(405, "method_not_allowed", payload, payload_summary)
                 return
-            self._send_html(200, "Portal Blog", self._render_articles(self.state.articles), session_user, allow_body=allow_body)
+            self._send_html(
+                200,
+                "Portal Blog",
+                self._render_articles(self.state.articles),
+                session_user,
+                allow_body=allow_body,
+            )
             self._log_event(200, "blog_index", payload, payload_summary)
             return
 
         if path.startswith("/category/"):
             cat = path.split("/category/", 1)[1].strip("/").lower()
             if cat not in {"tech", "iot"}:
-                self._send_html(404, "404 Not Found", f"<p>Category not found: {html.escape(cat)}</p>", session_user, allow_body=allow_body)
+                self._send_html(
+                    404,
+                    "404 Not Found",
+                    f"<p>Category not found: {html.escape(cat)}</p>",
+                    session_user,
+                    allow_body=allow_body,
+                )
                 self._log_event(404, "category_not_found", payload, {"category": cat})
                 return
             matched = [a for a in self.state.articles if a["category"] == cat]
-            self._send_html(200, f"Category: {cat.upper()}", self._render_articles(matched), session_user, allow_body=allow_body)
+            self._send_html(
+                200,
+                f"Category: {cat.upper()}",
+                self._render_articles(matched),
+                session_user,
+                allow_body=allow_body,
+            )
             self._log_event(200, "category_view", payload, {"category": cat})
             return
 
@@ -831,8 +1146,18 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                 self._log_event(200, "login_form", payload, payload_summary)
                 return
             if self.command == "POST":
-                user = str(payload.get("username") or payload.get("user_login") or payload.get("inputStr") or "")
-                pwd = str(payload.get("password") or payload.get("user_pass") or payload.get("inputPwd") or "")
+                user = str(
+                    payload.get("username")
+                    or payload.get("user_login")
+                    or payload.get("inputStr")
+                    or ""
+                )
+                pwd = str(
+                    payload.get("password")
+                    or payload.get("user_pass")
+                    or payload.get("inputPwd")
+                    or ""
+                )
                 ok, info = self.state.verify_login(user, pwd, self._client_ip())
                 if ok:
                     token = self.state.create_session(user, info)
@@ -841,7 +1166,10 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                         "Redirecting",
                         "<p>Signed in.</p>",
                         user,
-                        headers={"Location": "/admin/dashboard", "Set-Cookie": f"portal_session={token}; HttpOnly; Path=/"},
+                        headers={
+                            "Location": "/admin/dashboard",
+                            "Set-Cookie": f"portal_session={token}; HttpOnly; Path=/",
+                        },
                         allow_body=allow_body,
                     )
                     self._log_event(302, "login_success_decoy", payload, payload_summary)
@@ -856,12 +1184,26 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                     )
                     self._log_event(401, "login_failed", payload, payload_summary)
                 return
-            self._send_html(405, "405 Method Not Allowed", "<p>Use GET or POST.</p>", session_user, {"Allow": "GET, POST"}, allow_body)
+            self._send_html(
+                405,
+                "405 Method Not Allowed",
+                "<p>Use GET or POST.</p>",
+                session_user,
+                {"Allow": "GET, POST"},
+                allow_body,
+            )
             self._log_event(405, "method_not_allowed", payload, payload_summary)
             return
 
         if path == "/logout":
-            self._send_html(302, "Logged Out", "<p>Signed out.</p>", None, headers={"Location": "/", "Set-Cookie": "portal_session=; Max-Age=0; Path=/"}, allow_body=allow_body)
+            self._send_html(
+                302,
+                "Logged Out",
+                "<p>Signed out.</p>",
+                None,
+                headers={"Location": "/", "Set-Cookie": "portal_session=; Max-Age=0; Path=/"},
+                allow_body=allow_body,
+            )
             self._log_event(302, "logout", payload, payload_summary)
             return
 
@@ -877,25 +1219,58 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                 self._log_event(200, "register_form", payload, payload_summary)
                 return
             if self.command == "POST":
-                ok, msg = self.state.register_user(str(payload.get("username", "")), str(payload.get("password", "")))
-                self._send_html(200 if ok else 400, "Registration", f"<div class='notice'>{html.escape(msg)}</div>", session_user, allow_body=allow_body)
+                ok, msg = self.state.register_user(
+                    str(payload.get("username", "")),
+                    str(payload.get("password", "")),
+                )
+                self._send_html(
+                    200 if ok else 400,
+                    "Registration",
+                    f"<div class='notice'>{html.escape(msg)}</div>",
+                    session_user,
+                    allow_body=allow_body,
+                )
                 self._log_event(200 if ok else 400, "register_attempt", payload, payload_summary)
                 return
-            self._send_html(405, "405 Method Not Allowed", "<p>Use GET or POST.</p>", session_user, {"Allow": "GET, POST"}, allow_body)
+            self._send_html(
+                405,
+                "405 Method Not Allowed",
+                "<p>Use GET or POST.</p>",
+                session_user,
+                {"Allow": "GET, POST"},
+                allow_body,
+            )
             self._log_event(405, "method_not_allowed", payload, payload_summary)
             return
 
         if path == "/password/reset":
             if self.command == "GET":
-                form = "<form method='POST' action='/password/reset'><label>Username</label><input type='text' name='account' required><button type='submit'>Request Reset</button></form>"
+                form = (
+                    "<form method='POST' action='/password/reset'>"
+                    "<label>Username</label><input type='text' name='account' required>"
+                    "<button type='submit'>Request Reset</button></form>"
+                )
                 self._send_html(200, "Password Reset", form, session_user, allow_body=allow_body)
                 self._log_event(200, "password_reset_form", payload, payload_summary)
                 return
             if self.command == "POST":
-                self._send_html(200, "Password Reset", "<div class='notice'>Password reset request accepted in simulation.</div>", session_user, allow_body=allow_body)
+                self._send_html(
+                    200,
+                    "Password Reset",
+                    "<div class='notice'>Password reset request accepted in simulation.</div>",
+                    session_user,
+                    allow_body=allow_body,
+                )
                 self._log_event(200, "password_reset_post", payload, payload_summary)
                 return
-            self._send_html(405, "405 Method Not Allowed", "<p>Use GET or POST.</p>", session_user, {"Allow": "GET, POST"}, allow_body)
+            self._send_html(
+                405,
+                "405 Method Not Allowed",
+                "<p>Use GET or POST.</p>",
+                session_user,
+                {"Allow": "GET, POST"},
+                allow_body,
+            )
             self._log_event(405, "method_not_allowed", payload, payload_summary)
             return
 
@@ -913,26 +1288,64 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                 self._log_event(200, "new_post_form", payload, payload_summary)
                 return
             if self.command == "POST":
-                art = self.state.add_article(str(payload.get("title", "")), str(payload.get("category", "tech")), session_user or "guest", str(payload.get("body", "")))
-                self._send_html(200, "Post Published", f"<div class='notice'>Created article #<a href='/articles/{art['id']}'>{art['id']}</a>.</div>", session_user, allow_body=allow_body)
+                art = self.state.add_article(
+                    str(payload.get("title", "")),
+                    str(payload.get("category", "tech")),
+                    session_user or "guest",
+                    str(payload.get("body", "")),
+                )
+                self._send_html(
+                    200,
+                    "Post Published",
+                    f"<div class='notice'>Created article #<a href='/articles/{art['id']}'>{art['id']}</a>.</div>",
+                    session_user,
+                    allow_body=allow_body,
+                )
                 self._log_event(200, "post_created", payload, {"article_id": art["id"], **payload_summary})
                 return
-            self._send_html(405, "405 Method Not Allowed", "<p>Use GET or POST.</p>", session_user, {"Allow": "GET, POST"}, allow_body)
+            self._send_html(
+                405,
+                "405 Method Not Allowed",
+                "<p>Use GET or POST.</p>",
+                session_user,
+                {"Allow": "GET, POST"},
+                allow_body,
+            )
             self._log_event(405, "method_not_allowed", payload, payload_summary)
             return
 
         if path in {"/admin", "/admin/dashboard", "/admin/posts"}:
             if self.command not in {"GET", "HEAD"}:
-                self._send_html(405, "405 Method Not Allowed", "<p>Use GET or HEAD.</p>", session_user, {"Allow": "GET, HEAD"}, allow_body)
+                self._send_html(
+                    405,
+                    "405 Method Not Allowed",
+                    "<p>Use GET or HEAD.</p>",
+                    session_user,
+                    {"Allow": "GET, HEAD"},
+                    allow_body,
+                )
                 self._log_event(405, "method_not_allowed", payload, payload_summary)
                 return
             snap = self.state.snapshot()
-            self._send_html(200, f"Admin ({path})", f"<pre>{html.escape(json.dumps(snap, indent=2))}</pre>", session_user, allow_body=allow_body)
+            self._send_html(
+                200,
+                f"Admin ({path})",
+                f"<pre>{html.escape(json.dumps(snap, indent=2))}</pre>",
+                session_user,
+                allow_body=allow_body,
+            )
             self._log_event(200, "admin_view", payload, payload_summary)
             return
 
         # 4. IoT device management routes
-        if path in {"/iot/admin", "/iot/status", "/iot/network", "/iot/wifi", "/iot/firmware", "/cgi-bin/luci"}:
+        if path in {
+            "/iot/admin",
+            "/iot/status",
+            "/iot/network",
+            "/iot/wifi",
+            "/iot/firmware",
+            "/cgi-bin/luci",
+        }:
             if self.command == "GET":
                 cfg = self.state.device_config
                 form = (
@@ -956,16 +1369,33 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                 if "ssh_enabled" in norm:
                     norm["ssh_enabled"] = str(norm["ssh_enabled"]).lower() in {"1", "true", "yes", "on"}
                 updated = self.state.update_device_config(norm)
-                self._send_html(200, "IoT Settings Updated", f"<div class='notice'>Updated in memory.</div><pre>{html.escape(json.dumps(updated, indent=2))}</pre>", session_user, allow_body=allow_body)
+                self._send_html(
+                    200,
+                    "IoT Settings Updated",
+                    f"<div class='notice'>Updated in memory.</div><pre>{html.escape(json.dumps(updated, indent=2))}</pre>",
+                    session_user,
+                    allow_body=allow_body,
+                )
                 self._log_event(200, "iot_updated", payload, payload_summary)
                 return
-            self._send_html(405, "405 Method Not Allowed", "<p>Use GET or POST.</p>", session_user, {"Allow": "GET, POST"}, allow_body)
+            self._send_html(
+                405,
+                "405 Method Not Allowed",
+                "<p>Use GET or POST.</p>",
+                session_user,
+                {"Allow": "GET, POST"},
+                allow_body,
+            )
             self._log_event(405, "method_not_allowed", payload, payload_summary)
             return
 
         # 5. API & recon decoy endpoints
         if path == "/api/v1/status":
-            self._send_json(200, {"status": "ok", "service": "blog-iot-portal", "articles": len(self.state.articles)}, allow_body=allow_body)
+            self._send_json(
+                200,
+                {"status": "ok", "service": "blog-iot-portal", "articles": len(self.state.articles)},
+                allow_body=allow_body,
+            )
             self._log_event(200, "api_status", payload, payload_summary)
             return
 
@@ -975,7 +1405,12 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
                 self._log_event(200, "api_posts_get", payload, payload_summary)
                 return
             if self.command == "POST":
-                art = self.state.add_article(str(payload.get("title", "")), str(payload.get("category", "tech")), session_user or "api_client", str(payload.get("body", "")))
+                art = self.state.add_article(
+                    str(payload.get("title", "")),
+                    str(payload.get("category", "tech")),
+                    session_user or "api_client",
+                    str(payload.get("body", "")),
+                )
                 self._send_json(200, {"status": "created", "post": art}, allow_body=allow_body)
                 self._log_event(200, "api_posts_post", payload, {"article_id": art["id"], **payload_summary})
                 return
@@ -1002,7 +1437,15 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
 
         if path == "/api/v1/device/status":
             cfg = self.state.device_config
-            self._send_json(200, {"model": cfg["device_model"], "firmware": cfg["firmware_version"], "hostname": cfg["hostname"]}, allow_body=allow_body)
+            self._send_json(
+                200,
+                {
+                    "model": cfg["device_model"],
+                    "firmware": cfg["firmware_version"],
+                    "hostname": cfg["hostname"],
+                },
+                allow_body=allow_body,
+            )
             self._log_event(200, "api_device_status", payload, payload_summary)
             return
 
@@ -1021,7 +1464,12 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/.env":
-            self._send_raw(200, "text/plain; charset=utf-8", self.state.dotenv_decoy.encode("utf-8"), allow_body=allow_body)
+            self._send_raw(
+                200,
+                "text/plain; charset=utf-8",
+                self.state.dotenv_decoy.encode("utf-8"),
+                allow_body=allow_body,
+            )
             self._log_event(200, "decoy_dotenv", payload, payload_summary)
             return
 
@@ -1036,7 +1484,7 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
             return
 
         if path in {"/actuator", "/actuator/env"}:
-            self._send_json(200, {"profiles": ["simulation"], "service": "blog-iot-portal"}, allow_body=allow_body)
+            self._send_json(200, self.state.emulator.actuator_env_decoy, allow_body=allow_body)
             self._log_event(200, "decoy_actuator", payload, payload_summary)
             return
 
@@ -1045,24 +1493,50 @@ class BlogIoTPortalHandler(BaseHTTPRequestHandler):
             self._log_event(501, "decoy_server_status", payload, payload_summary)
             return
 
-        self._send_html(404, "404 Not Found", f"<p>Not found: <code>{html.escape(path)}</code></p>", session_user, allow_body=allow_body)
+        self._send_html(
+            404,
+            "404 Not Found",
+            f"<p>Not found: <code>{html.escape(path)}</code></p>",
+            session_user,
+            allow_body=allow_body,
+        )
         self._log_event(404, "not_found", payload, payload_summary)
 
 
-def run_blog_iot_honeypot(host: str = "127.0.0.1", port: int = 8080) -> None:
-    """Start the Medium-Interaction Blog + IoT Portal honeypot server."""
-    state = BlogIoTPortalState()
-    BlogIoTPortalHandler.state = state
-    httpd = ThreadingHTTPServer((host, port), BlogIoTPortalHandler)
-    state.record_event({"event_type": "server_start", "client_ip": host, "method": "INIT", "path": "/", "status_code": 200, "outcome": "listening", "payload": {"port": port}})
+def run_honeypot(host: str = "127.0.0.1", port: int = 8080) -> None:
+    """Start the expanded Medium-Interaction Blog + IoT + Web Decoy honeypot server."""
+    state = HoneypotState()
+    HoneypotHandler.state = state
+    httpd = ThreadingHTTPServer((host, port), HoneypotHandler)
+    state.record_event(
+        {
+            "event_type": "server_start",
+            "client_ip": host,
+            "method": "INIT",
+            "path": "/",
+            "status_code": 200,
+            "outcome": "listening",
+            "payload": {"port": port},
+        }
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         httpd.server_close()
-        state.record_event({"event_type": "server_stop", "client_ip": host, "method": "SHUTDOWN", "path": "/", "status_code": 200, "outcome": "stopped", "payload": state.snapshot()})
+        state.record_event(
+            {
+                "event_type": "server_stop",
+                "client_ip": host,
+                "method": "SHUTDOWN",
+                "path": "/",
+                "status_code": 200,
+                "outcome": "stopped",
+                "payload": state.snapshot(),
+            }
+        )
 
 
 if __name__ == "__main__":
-    run_blog_iot_honeypot(host="0.0.0.0", port=8080)
+    run_honeypot(host="0.0.0.0", port=8080)
