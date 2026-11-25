@@ -1,5 +1,16 @@
 #!/bin/bash
 set -euo pipefail
+#!/bin/bash
+set -euo pipefail
+
+# 主要ポートの定義やArtifact RegistryのイメージURI設定
+PORTS=(80 81 443 8080 8443 3306 5432 6379 27017) # 他ポートは適宜調整
+IMAGE_URI="asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest"
+
+# 1. ネットワーク（iptables）のガチガチ防御設定
+# 2. Google Private Access 経由で Artifact Registry からメインコンテナを取得・起動
+# 3. パケット録画（gcr.io/://google.com を使用）
+
 
 # ==============================================================================
 # 世界の攻撃ボット・スキャナーが狙う主要ポート（Web / 管理画面 / Proxy / DB / IoT / 監視系）
