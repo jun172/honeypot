@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Expanded Medium-Interaction Blog + IoT + Web Decoy Honeypot (Standard Library Only).
+Yaho! News-style Medium-Interaction Honeypot with SQLite & Decoy Vulnerabilities.
 
-Simulates a multi-layer decoy portal in memory and emits structured JSON events
-to stdout. No real files are written, no external network calls are made, and no
-OS commands or dynamic code evaluation (subprocess / os.system / eval) are used.
+Simulates a Japanese news portal backed by SQLite (/tmp/portal_news.db) with
+intentional, safe-to-host decoy vulnerabilities (SQLi, Reflected/Stored XSS,
+IDOR, Path Traversal/LFI, SSRF metadata decoy, Command Injection / Next.js RSC
+RCE emulation) while emitting structured JSON telemetry to stdout.
+No real OS commands are executed and no external network calls are made.
 """
 
 from __future__ import annotations
@@ -18,8 +20,10 @@ import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import os
 import re
 import secrets
+import sqlite3
 import threading
 import time
 from typing import Any
@@ -29,9 +33,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 _PROXY_INTERNAL_HEADERS: frozenset[str] = frozenset(
     {
         "x-real-ip",
+        "x-real-port",
         "x-forwarded-for",
         "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-original-port",
         "x-proxy-verified",
+        "x-ssl-protocol",
+        "x-ssl-cipher",
+        "x-ssl-server-name",
     }
 )
 
@@ -40,6 +50,20 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _DOMAIN_RE = re.compile(
     r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}\b",
     re.IGNORECASE,
+)
+_JS_NOISE_DOMAINS: frozenset[str] = frozenset(
+    {
+        "process.mainmodule.require",
+        "c.spawn",
+        "n.socket",
+        "cl.connect",
+        "cl.pipe",
+        "s.stdin",
+        "s.stdout.pipe",
+        "s.stderr.pipe",
+        "child_process.exec",
+        "child_process.spawn",
+    }
 )
 _B64_RE = re.compile(r"\b[A-Za-z0-9+/]{16,}={0,2}\b")
 _HEX_RE = re.compile(r"(?:\\x[0-9a-fA-F]{2}){4,}|\b[0-9a-fA-F]{24,}\b")
@@ -54,6 +78,13 @@ _PHP_ECHO_RE = re.compile(
 )
 
 _TECHNIQUE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "nextjs_rsc_rce",
+        re.compile(
+            r"(?:\$1:__proto__:then|resolved_model|_response|_prefix|process\.mainModule|child_process|next-action)",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "rce_cmd_injection",
         re.compile(
@@ -72,28 +103,28 @@ _TECHNIQUE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "sqli",
         re.compile(
-            r"(?:\bunion\b(?:\s+all)?\s+\bselect\b|\bor\b\s+1\s*=\s*1|\band\b\s+1\s*=\s*1|\bsleep\s*\(|\bbenchmark\s*\(|\bextractvalue\s*\(|\bupdatexml\s*\(|--\s|/\*[\s\S]*?\*/)",
+            r"(?:\bunion\b(?:\s+all)?\s+\bselect\b|\bor\b\s+['\"]?1['\"]?\s*=\s*['\"]?1|\band\b\s+1\s*=\s*1|\bsleep\s*\(|\bbenchmark\s*\(|\bsqlite_master\b|\bextractvalue\s*\(|\bupdatexml\s*\(|'\s*--)",
             re.IGNORECASE,
         ),
     ),
     (
         "xss",
         re.compile(
-            r"(?:<script\b|javascript:|onerror\s*=|onload\s*=|onmouseover\s*=|document\.cookie|<svg\b|<iframe\b)",
+            r"(?:<script\b|javascript:|onerror\s*=|onload\s*=|onmouseover\s*=|document\.cookie|<svg\b|<iframe\b|alert\s*\()",
             re.IGNORECASE,
         ),
     ),
     (
         "path_traversal",
         re.compile(
-            r"(?:\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|\.\.%2f|%2e%2e%5c|/etc/passwd|/etc/shadow|/proc/self/environ)",
+            r"(?:\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|\.\.%2f|%2e%2e%5c|/etc/passwd|/etc/shadow|/proc/self/environ|portal_news\.db)",
             re.IGNORECASE,
         ),
     ),
     (
         "ssrf_cloud_metadata",
         re.compile(
-            r"(?:169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|fd00:ec2::254|/latest/meta-data/)",
+            r"(?:169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|fd00:ec2::254|/latest/meta-data/|computeMetadata/v1)",
             re.IGNORECASE,
         ),
     ),
@@ -135,16 +166,32 @@ _TECHNIQUE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "scanner_recon",
         re.compile(
-            r"(?:/\.env|/config\.json|/backup\.zip|/server-status|/wp-admin/admin-ajax\.php|/script\b|sqlmap|nikto|masscan|zgrab|nuclei|dirbuster|gobuster)",
+            r"(?:/\.env|/config\.json|/backup\.zip|/server-status|/wp-admin/admin-ajax\.php|/script\b|/phpinfo\.php|sqlmap|nikto|masscan|zgrab|nuclei|dirbuster|gobuster)",
             re.IGNORECASE,
         ),
     ),
 ]
 
+CATEGORIES: dict[str, str] = {
+    "top": "主要",
+    "domestic": "国内",
+    "world": "国際",
+    "economy": "経済",
+    "ent": "エンタメ",
+    "sports": "スポーツ",
+    "it": "IT",
+    "science": "科学",
+}
+
 
 def utc_now_iso() -> str:
     """Return current UTC timestamp in ISO-8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def display_time_str() -> str:
+    """Return formatted UTC timestamp for portal header display."""
+    return datetime.now(timezone.utc).strftime("%m/%d(%a) %H:%M UTC")
 
 
 def sha256_short(value: str, length: int = 16) -> str:
@@ -173,22 +220,41 @@ def _classify_ip(ip_str: str) -> tuple[bool, str]:
     return True, "public"
 
 
+def _clean_printable(text: str) -> str:
+    printable = "".join(ch for ch in text if ch.isprintable() or ch in "\r\n\t")
+    return printable.strip()[:2000]
+
+
+def _decode_base64_once(token: str) -> str | None:
+    padded = token + ("=" * ((4 - len(token) % 4) % 4))
+    try:
+        raw = base64.b64decode(padded, validate=False)
+        decoded = raw.decode("utf-8", errors="ignore")
+        cleaned = _clean_printable(decoded)
+        return cleaned if len(cleaned) >= 4 else None
+    except Exception:
+        return None
+
+
 def _decode_base64_candidates(text: str) -> list[str]:
-    """Safely attempt base64 decoding and keep printable strings."""
+    """Safely attempt 1st and 2nd stage Base64 + URL decoding."""
     out: list[str] = []
     seen: set[str] = set()
     for token in _B64_RE.findall(text)[:25]:
-        padded = token + ("=" * ((4 - len(token) % 4) % 4))
-        try:
-            raw = base64.b64decode(padded, validate=False)
-            decoded = raw.decode("utf-8", errors="ignore").strip()
-            printable = "".join(ch for ch in decoded if ch.isprintable() or ch in "\r\n\t")
-            clipped = printable[:2000]
-            if len(printable) >= 4 and clipped not in seen:
-                seen.add(clipped)
-                out.append(clipped)
-        except Exception:
-            continue
+        first = _decode_base64_once(token)
+        if first and first not in seen:
+            seen.add(first)
+            out.append(first)
+            # Second stage: URL-unquote and check nested Base64
+            stage2_text = unquote(first)
+            if stage2_text != first and stage2_text not in seen:
+                seen.add(stage2_text)
+                out.append(stage2_text)
+            for inner_tok in _B64_RE.findall(stage2_text)[:10]:
+                second = _decode_base64_once(inner_tok)
+                if second and second not in seen:
+                    seen.add(second)
+                    out.append(second)
     return out
 
 
@@ -202,12 +268,10 @@ def _decode_hex_candidates(text: str) -> list[str]:
             continue
         try:
             raw = binascii.unhexlify(cleaned)
-            decoded = raw.decode("utf-8", errors="ignore").strip()
-            printable = "".join(ch for ch in decoded if ch.isprintable() or ch in "\r\n\t")
-            clipped = printable[:2000]
-            if len(printable) >= 4 and clipped not in seen:
-                seen.add(clipped)
-                out.append(clipped)
+            decoded = _clean_printable(raw.decode("utf-8", errors="ignore"))
+            if len(decoded) >= 4 and decoded not in seen:
+                seen.add(decoded)
+                out.append(decoded)
         except Exception:
             continue
     return out
@@ -232,37 +296,45 @@ class VirtualAttackEmulator:
             [
                 "root:x:0:0:root:/root:/bin/bash",
                 "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin",
-                "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin",
-                "appuser:x:1000:1000:App User:/home/appuser:/bin/bash",
+                "www-data:x:33:33:www-data:/var/www/html:/usr/sbin/nologin",
+                "news_batch:x:1001:1001:News Editorial Batch:/home/news_batch:/bin/bash",
+                "sqlite_backup:x:1002:1002:SQLite Snapshot:/var/backups/sqlite:/bin/sh",
                 "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin",
             ]
         )
         self.laravel_env_decoy = "\n".join(
             [
-                "# SIMULATED HONEYPOT ENV DECOY",
-                "APP_NAME=PortalDecoy",
-                "APP_ENV=staging-sim",
+                "APP_NAME=YahoNewsPortal",
+                "APP_ENV=production",
+                "APP_KEY=base64:SIMULATEDNEWSKEY000000000000000000000000001=",
                 "APP_DEBUG=true",
-                "DB_CONNECTION=mysql",
-                "DB_HOST=127.0.0.1",
-                "DB_PORT=3306",
-                "DB_DATABASE=portal_decoy_db",
-                "DB_USERNAME=decoy_db_user",
-                "DB_PASSWORD=SIMULATED_DECOY_DB_PASS_0001",
-                "AWS_ACCESS_KEY_ID=AKIASIMULATED00000001",
-                "AWS_SECRET_ACCESS_KEY=SIMULATED_DECOY_AWS_SECRET_0001",
+                "DB_CONNECTION=sqlite",
+                "DB_DATABASE=/tmp/portal_news.db",
+                "EDITORIAL_API_TOKEN=ynp_live_9981203981203981_decoy",
+                "AWS_ACCESS_KEY_ID=AKIASIMULATEDNEWS0001",
+                "AWS_SECRET_ACCESS_KEY=SIMULATED_NEWS_AWS_SECRET_0001",
                 "AWS_DEFAULT_REGION=ap-northeast-1",
             ]
         )
+        self.metadata_decoy: dict[str, Any] = {
+            "instance-id": "i-09f8e7d6c5b4a3210",
+            "local-ipv4": "10.146.0.14",
+            "public-hostname": "news-web-prod-01.ap-northeast-1.compute.internal",
+            "iam": {
+                "role": "news-editorial-prod-role",
+                "AccessKeyId": "ASIASIMULATEDMETADATA01",
+                "SecretAccessKey": "SIMULATED_METADATA_SECRET_KEY_0001",
+                "Token": "IQoJb3JpZ2luX2VjECoaDmFwLW5vcnRoZWFzdC0xSIMULATED",
+            },
+        }
         self.actuator_env_decoy: dict[str, Any] = {
-            "activeProfiles": ["simulation"],
+            "activeProfiles": ["production"],
             "propertySources": [
                 {
-                    "name": "simulatedConfigService",
+                    "name": "applicationConfig: [classpath:/application-prod.yml]",
                     "properties": {
-                        "spring.datasource.url": {"value": "jdbc:mysql://127.0.0.1:3306/sim_app"},
-                        "spring.datasource.username": {"value": "sim_spring_user"},
-                        "spring.datasource.password": {"value": "SIMULATED_SPRING_SECRET_0001"},
+                        "spring.datasource.url": {"value": "jdbc:sqlite:/tmp/portal_news.db"},
+                        "editorial.jwt.secret": {"value": "SIMULATED_NEWS_JWT_SECRET_2026"},
                     },
                 }
             ],
@@ -284,7 +356,6 @@ class HttpFingerprinter:
         raw_headers: list[tuple[str, str]],
         arrival_monotonic: float,
     ) -> dict[str, Any]:
-        """Compute an HTTP communication fingerprint from client-originated headers."""
         filtered_headers = [
             (k, v)
             for k, v in raw_headers
@@ -354,7 +425,7 @@ class HttpFingerprinter:
 
 
 class ThreatIntelEngine:
-    """Extract IOCs, decode Base64/Hex/URL strings, and tag 13 attack techniques."""
+    """Extract IOCs, decode multi-stage Base64/Hex/URL strings, and tag attack techniques."""
 
     def __init__(self) -> None:
         self.known_bad_ips: set[str] = {"198.51.100.66", "203.0.113.77"}
@@ -384,7 +455,6 @@ class ThreatIntelEngine:
         raw_headers: list[tuple[str, str]],
         payload_dict: dict[str, Any],
     ) -> dict[str, Any]:
-        """Scan path, query, headers, and payload (with URL/Base64/Hex decoding)."""
         parts: list[str] = []
         if raw_path:
             parts.append(f"path={unquote(raw_path)}")
@@ -395,7 +465,7 @@ class ThreatIntelEngine:
         for k, v in list(payload_dict.items())[:50]:
             parts.append(f"{k}={v}")
 
-        raw_text = unquote("\n".join(parts))[:16000]
+        raw_text = unquote(unquote("\n".join(parts)))[:16000]
         decoded_b64 = _decode_base64_candidates(raw_text)
         decoded_hex = _decode_hex_candidates(raw_text)
 
@@ -404,7 +474,11 @@ class ThreatIntelEngine:
 
         captured_urls = list(dict.fromkeys(_URL_RE.findall(corpus)))[:30]
         raw_ips = list(dict.fromkeys(_IPV4_RE.findall(corpus)))[:30]
-        domains = list(dict.fromkeys(d.lower() for d in _DOMAIN_RE.findall(corpus)))[:30]
+        domains = [
+            d
+            for d in dict.fromkeys(d.lower() for d in _DOMAIN_RE.findall(corpus))
+            if d not in _JS_NOISE_DOMAINS
+        ][:30]
 
         ip_items: list[dict[str, Any]] = []
         for ip_cand in raw_ips:
@@ -459,8 +533,321 @@ class ThreatIntelEngine:
         }
 
 
+class NewsSQLiteStore:
+    """SQLite database backing the Yaho! News-style portal with intentional SQLi surfaces."""
+
+    def __init__(self, db_path: str = "/tmp/portal_news.db") -> None:
+        self.lock = threading.Lock()
+        self.db_path = db_path
+        try:
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        except sqlite3.Error:
+            self.db_path = ":memory:"
+            self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    email TEXT NOT NULL,
+                    api_token TEXT NOT NULL,
+                    internal_note TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS articles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    media_name TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    views INTEGER NOT NULL DEFAULT 0,
+                    is_pickup INTEGER NOT NULL DEFAULT 1,
+                    badge TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL,
+                    body TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    article_id INTEGER NOT NULL,
+                    author_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    likes INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            cur.execute("SELECT COUNT(*) FROM users")
+            if cur.fetchone()[0] == 0:
+                cur.executemany(
+                    "INSERT INTO users (username, password, role, email, api_token, internal_note) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            "admin",
+                            "YahoNewsAdmin2026!",
+                            "chief_editor",
+                            "admin@news-portal.example.jp",
+                            "ynp_tok_admin_9918273645_decoy",
+                            "編成デスク統括アカウント（DB管理権限あり）",
+                        ),
+                        (
+                            "desk_kobe",
+                            "KobeDesk#1126",
+                            "editor",
+                            "kobe-desk@news-portal.example.jp",
+                            "ynp_tok_editor_5544332211_decoy",
+                            "関西支局配信担当・速報テロップ承認権限",
+                        ),
+                        (
+                            "api_sync",
+                            "SyncFeed@2026",
+                            "service",
+                            "feed-bot@news-portal.example.jp",
+                            "ynp_tok_bot_7766554433_decoy",
+                            "提携メディアRSS自動取込バッチ用",
+                        ),
+                    ],
+                )
+
+            cur.execute("SELECT COUNT(*) FROM articles")
+            if cur.fetchone()[0] == 0:
+                seed_articles = [
+                    (
+                        101,
+                        "冬の日本海側で大雪警戒 交通機関の乱れに注意",
+                        "domestic",
+                        "共同通信",
+                        "11/26(木) 9:12",
+                        48210,
+                        1,
+                        "速報",
+                        "強い冬型の気圧配置の影響で、北日本から西日本の日本海側を中心に大雪となる見込み。",
+                        "気象庁によると、上空に強い寒気が流れ込んでいる影響で、日本海側を中心に平地でも積雪が急増する恐れがある。JR各社や高速道路会社は計画運休や予防的通行止めの可能性を呼びかけており、最新の運行情報の確認が求められる。",
+                    ),
+                    (
+                        102,
+                        "円相場 1ドル154円台後半で推移 日銀の金融政策に注目",
+                        "economy",
+                        "時事通信",
+                        "11/26(木) 8:55",
+                        35900,
+                        1,
+                        "注目",
+                        "東京外国為替市場の円相場は1ドル＝154円台後半を中心に小幅な値動きが続いている。",
+                        "26日午前の東京外国為替市場では、米長期金利の動向と来月の日銀金融政策決定会合を見極めたいとの思惑から、1ドル＝154円70銭前後での取引が続いている。市場関係者の間では追加利上げの時期を巡り見方が分かれている。",
+                    ),
+                    (
+                        103,
+                        "国内クラウド基盤への自動スキャン急増 専門家が警鐘",
+                        "it",
+                        "ITmedia NEWS",
+                        "11/26(木) 8:40",
+                        61420,
+                        1,
+                        "独自",
+                        "公開サーバーやWebフレームワークの既知の脆弱性を狙う自動スキャンが国内外で増加している。",
+                        "セキュリティ研究機関の観測によると、未パッチのWebアプリケーションや管理画面ポートを標的とした自動探索通信が前月比で約1.6倍に増加した。専門家は不要ポートの閉鎖とWAF・認証強化の徹底を呼びかけている。",
+                    ),
+                    (
+                        104,
+                        "プロ野球 契約更改が本格化 若手主力の大幅昇給相次ぐ",
+                        "sports",
+                        "スポニチアネックス",
+                        "11/26(木) 8:15",
+                        29340,
+                        1,
+                        "",
+                        "各球団で契約更改交渉が本格化し、今季ブレークを果たした若手選手に大幅増額提示が続いている。",
+                        "セ・パ両リーグの各球団事務所で26日も契約更改交渉が行われ、先発ローテーションを守り抜いた若手投手や主力野手が笑顔で会見に臨んだ。来季のタイトル獲得へ向け早くも意欲を見せている。",
+                    ),
+                    (
+                        105,
+                        "欧州連合 AI規制法の運用指針案を公表 企業対応が焦点に",
+                        "world",
+                        "ロイター",
+                        "11/26(木) 7:50",
+                        22180,
+                        1,
+                        "",
+                        "欧州委員会は生成AIを含む高リスクAIシステムに関する新たな運用ガイドライン案を示した。",
+                        "欧州委員会は域内でAIサービスを提供する企業に対し、学習データの透明性確保とリスク評価報告を求める実務指針案を公表した。日本企業を含むグローバルIT各社にも影響が及ぶ見通しだ。",
+                    ),
+                    (
+                        106,
+                        "年末商戦に向け百貨店各社が福袋予約を開始 体験型が人気",
+                        "economy",
+                        "毎日新聞",
+                        "11/26(木) 7:30",
+                        18750,
+                        1,
+                        "",
+                        "大手百貨店各社が2027年新春福袋の先行予約を本格化させ、家族で楽しめる体験型企画が好調だ。",
+                        "物価高が続くなかでも特別感のある消費への需要は底堅く、宿泊体験や限定グルメを組み合わせた福袋への応募が例年を上回るペースで伸びている。",
+                    ),
+                    (
+                        107,
+                        "人気ドラマ最終回 放送直後からSNSで考察投稿が殺到",
+                        "ent",
+                        "オリコン",
+                        "11/26(木) 7:05",
+                        41200,
+                        1,
+                        "話題",
+                        "昨夜放送された連続ドラマの最終回を受け、関連ワードがSNSトレンド上位を独占した。",
+                        "最終盤の伏線回収とサプライズ演出に対し、視聴者からは「鳥肌が立った」「続編を期待したい」といった感想が相次ぎ、見逃し配信の再生数も過去最高ペースを記録している。",
+                    ),
+                    (
+                        108,
+                        "次世代全固体電池の量産技術に前進 航続距離2割向上へ",
+                        "science",
+                        "日刊工業新聞",
+                        "11/26(木) 6:45",
+                        27640,
+                        1,
+                        "",
+                        "国内研究チームが全固体電池の界面抵抗を低減する新手法を開発し、充電時間の短縮に道を開いた。",
+                        "研究グループは独自の固体電解質コーティング技術により、従来課題だった充放電サイクル時の劣化を大幅に抑制することに成功した。車載向け実用化に向けた実証試験が来春にも始まる。",
+                    ),
+                ]
+                cur.executemany(
+                    """
+                    INSERT INTO articles (id, title, category, media_name, published_at, views, is_pickup, badge, summary, body)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    seed_articles,
+                )
+
+            cur.execute("SELECT COUNT(*) FROM comments")
+            if cur.fetchone()[0] == 0:
+                cur.executemany(
+                    "INSERT INTO comments (article_id, author_name, content, likes, created_at) VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (101, "hyogo_commuter", "朝のJR線も少し遅れが出ていました。早めの移動が安心ですね。", 142, "11/26 9:18"),
+                        (103, "sec_engineer", "海外IPからの自動スキャンは24時間ずっと来ているのでFW設定が必須。", 218, "11/26 8:52"),
+                        (102, "market_watcher", "来月の会合までは154〜155円レンジの攻防が続きそう。", 64, "11/26 9:05"),
+                    ],
+                )
+            self.conn.commit()
+
+    def list_articles(self, category: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            if category and category != "top":
+                cur.execute(
+                    "SELECT * FROM articles WHERE category = ? ORDER BY id DESC LIMIT ?",
+                    (category, limit),
+                )
+            else:
+                cur.execute("SELECT * FROM articles ORDER BY is_pickup DESC, id ASC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def ranking_articles(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT id, title, media_name, views FROM articles ORDER BY views DESC LIMIT ?", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_article(self, article_id: int) -> dict[str, Any] | None:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("UPDATE articles SET views = views + 1 WHERE id = ?", (article_id,))
+            self.conn.commit()
+            cur.execute("SELECT * FROM articles WHERE id = ?", (article_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def get_comments(self, article_id: int) -> list[dict[str, Any]]:
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM comments WHERE article_id = ? ORDER BY id DESC LIMIT 50", (article_id,))
+            return [dict(r) for r in cur.fetchall()]
+
+    def add_comment(self, article_id: int, author_name: str, content: str) -> None:
+        """Store comment intentionally unfiltered to act as a Stored XSS decoy."""
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                "INSERT INTO comments (article_id, author_name, content, likes, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    article_id,
+                    (author_name.strip() or "匿名ユーザー")[:60],
+                    content[:1000],
+                    1,
+                    datetime.now(timezone.utc).strftime("%m/%d %H:%M"),
+                ),
+            )
+            self.conn.commit()
+
+    def add_article(self, title: str, category: str, media_name: str, body: str) -> int:
+        cat = category if category in CATEGORIES and category != "top" else "it"
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO articles (title, category, media_name, published_at, views, is_pickup, badge, summary, body)
+                VALUES (?, ?, ?, ?, 1, 1, '新着', ?, ?)
+                """,
+                (
+                    (title.strip() or "無題のニュース")[:120],
+                    cat,
+                    (media_name.strip() or "ユーザー投稿")[:40],
+                    datetime.now(timezone.utc).strftime("%m/%d(%a) %H:%M"),
+                    body.strip()[:120] or "本文なし",
+                    body.strip()[:3000] or "本文なし",
+                ),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid or 109)
+
+    def vulnerable_search(self, raw_query: str) -> tuple[list[dict[str, Any]], str | None, str]:
+        """Intentionally vulnerable string-concatenated SELECT on SQLite."""
+        sql = (
+            "SELECT id, title, category, media_name, published_at, summary "
+            f"FROM articles WHERE title LIKE '%{raw_query}%' OR summary LIKE '%{raw_query}%' ORDER BY id DESC"
+        )
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(sql)
+                rows = [dict(r) for r in cur.fetchall()]
+                return rows, None, sql
+            except sqlite3.Error as exc:
+                return [], f"sqlite3.OperationalError: {exc} | SQL: {sql}", sql
+
+    def vulnerable_login(self, username: str, password: str) -> tuple[dict[str, Any] | None, str | None, str]:
+        """Intentionally vulnerable string-concatenated login query on SQLite."""
+        sql = f"SELECT id, username, role, email FROM users WHERE username = '{username}' AND password = '{password}' LIMIT 1"
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(sql)
+                row = cur.fetchone()
+                return (dict(row) if row else None), None, sql
+            except sqlite3.Error as exc:
+                return None, f"sqlite3.OperationalError: {exc} | SQL: {sql}", sql
+
+    def get_user_by_id_idor(self, user_id_raw: str) -> tuple[list[dict[str, Any]], str | None]:
+        """Intentionally vulnerable IDOR + SQLi endpoint returning user records."""
+        sql = f"SELECT id, username, role, email, api_token, internal_note FROM users WHERE id = {user_id_raw}"
+        with self.lock:
+            cur = self.conn.cursor()
+            try:
+                cur.execute(sql)
+                return [dict(r) for r in cur.fetchall()], None
+            except sqlite3.Error as exc:
+                return [], f"sqlite3.OperationalError: {exc}"
+
+
 class HoneypotState:
-    """Thread-safe in-memory state for the expanded Honeypot."""
+    """Thread-safe state combining SQLite news store and security telemetry."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -474,78 +861,31 @@ class HoneypotState:
         self.fingerprinter = HttpFingerprinter()
         self.threat_intel_engine = ThreatIntelEngine()
         self.emulator = VirtualAttackEmulator()
-
-        self.users: dict[str, dict[str, str]] = {
-            "admin": {"password_hash": sha256_short("PortalAdmin#2026"), "role": "admin"},
-            "editor": {"password_hash": sha256_short("BlogEditor!2026"), "role": "editor"},
-            "iot_ops": {"password_hash": sha256_short("IoTGateway@2026"), "role": "iot_admin"},
-        }
+        self.db = NewsSQLiteStore(os.environ.get("HONEYPOT_DB_PATH", "/tmp/portal_news.db"))
         self.sessions: dict[str, dict[str, Any]] = {}
-
-        self.articles: list[dict[str, Any]] = [
-            {
-                "id": 101,
-                "title": "Hardening Edge Gateways and Observing Automated Web Scans",
-                "category": "iot",
-                "author": "iot_ops",
-                "published_at": "2026-11-23 20:00 UTC",
-                "summary": "Notes on separating management planes, firmware hygiene, and HTTP request telemetry.",
-                "body": (
-                    "Edge devices and web portals routinely face automated probes across login forms, "
-                    "API endpoints, and legacy paths. Isolating management interfaces and recording "
-                    "structured request telemetry provides clear visibility without exposing real assets."
-                ),
-            },
-            {
-                "id": 102,
-                "title": "Structured HTTP Fingerprinting for Web Traffic Triage",
-                "category": "tech",
-                "author": "editor",
-                "published_at": "2026-11-23 18:30 UTC",
-                "summary": "Comparing header ordering, timing cadence, and payload indicators in traffic logs.",
-                "body": (
-                    "Combining header structure, request cadence, and payload indicator extraction helps "
-                    "analysts separate standard browser traffic from scripted reconnaissance and probe bursts."
-                ),
-            },
-            {
-                "id": 103,
-                "title": "Segmenting Sensor Subnets and Admin Consoles in Lab Networks",
-                "category": "iot",
-                "author": "admin",
-                "published_at": "2026-11-23 16:15 UTC",
-                "summary": "Practical layout notes for VLAN isolation, DHCP scopes, and staged firmware channels.",
-                "body": (
-                    "Lab and facility networks benefit from clear segmentation between telemetry endpoints, "
-                    "guest wireless networks, and administrative consoles."
-                ),
-            },
-        ]
-        self.next_article_id = 104
 
         self.device_config: dict[str, Any] = {
             "device_model": "DecoyGateway-X200",
             "firmware_version": "v3.8.2-sim",
-            "hostname": "edge-gw-sim-01",
+            "hostname": "news-edge-gw-01",
             "wan": {"mode": "dhcp", "ip_address": "198.51.100.10", "gateway": "198.51.100.1"},
             "lan": {"ip_address": "192.168.10.1", "subnet_mask": "255.255.255.0", "dhcp_enabled": True},
-            "wifi": {"ssid_2g": "LabNet-2G", "ssid_5g": "LabNet-5G", "security": "WPA2-PSK"},
-            "remote_management": {"ssh_enabled": False, "web_admin_port": 8443},
         }
-
         self.dotenv_decoy = self.emulator.laravel_env_decoy
         self.config_json_decoy: dict[str, Any] = {
-            "service": "blog-iot-portal",
-            "environment": "simulation",
-            "endpoints": {"blog": "/blog", "api": "/api/v1/status", "device": "/api/v1/device/status"},
-            "device": {
-                "model": self.device_config["device_model"],
-                "firmware": self.device_config["firmware_version"],
+            "service": "yaho-news-portal",
+            "environment": "production",
+            "db_path": self.db.db_path,
+            "endpoints": {
+                "news": "/",
+                "search": "/search?q=",
+                "user_profile_idor": "/api/v1/users/profile?id=1",
+                "ssrf_preview": "/api/v1/fetch?url=",
+                "download_lfi": "/download?file=",
             },
         }
 
     def record_event(self, event: dict[str, Any]) -> None:
-        """Append event to in-memory ring buffer and emit structured JSON to stdout."""
         enriched = {"timestamp": utc_now_iso(), **event}
         intel = enriched.get("threat_intel") or {}
         urls = intel.get("captured_attacker_urls") or []
@@ -563,86 +903,23 @@ class HoneypotState:
         print(json.dumps(enriched, ensure_ascii=True), flush=True)
 
     def create_session(self, username: str, role: str) -> str:
-        """Create a synthetic session token in memory."""
         token = secrets.token_hex(16)
         with self.lock:
             self.sessions[token] = {"username": username, "role": role, "created_at": utc_now_iso()}
         return token
 
     def get_session(self, token: str | None) -> dict[str, Any] | None:
-        """Retrieve a synthetic session by token."""
         if not token:
             return None
         with self.lock:
             return self.sessions.get(token)
 
-    def register_user(self, username: str, password: str) -> tuple[bool, str]:
-        """Register a synthetic user account in memory."""
-        clean = username.strip()[:40]
-        if not clean or not password:
-            return False, "Username and password are required."
-        with self.lock:
-            if clean in self.users:
-                return False, "Username already exists."
-            self.users[clean] = {"password_hash": sha256_short(password), "role": "user"}
-        return True, "Account registered."
-
-    def verify_login(self, username: str, password: str, client_ip: str) -> tuple[bool, str]:
-        """Verify credentials against in-memory synthetic accounts."""
-        clean = username.strip()
-        with self.lock:
-            user = self.users.get(clean)
-            if user is None or user["password_hash"] != sha256_short(password):
-                self.failed_logins_by_ip[client_ip] += 1
-                return False, "Invalid username or password."
-            return True, user["role"]
-
-    def add_article(self, title: str, category: str, author: str, body: str) -> dict[str, Any]:
-        """Create a new article in memory."""
-        clean_cat = category.strip().lower()
-        if clean_cat not in {"tech", "iot"}:
-            clean_cat = "tech"
-        with self.lock:
-            art = {
-                "id": self.next_article_id,
-                "title": title.strip()[:140] or "Untitled Entry",
-                "category": clean_cat,
-                "author": author.strip()[:40] or "guest",
-                "published_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                "summary": body.strip()[:140] or "Summary entry.",
-                "body": body.strip()[:2000] or "Body entry.",
-            }
-            self.next_article_id += 1
-            self.articles.insert(0, art)
-            return dict(art)
-
-    def update_device_config(self, updates: dict[str, Any]) -> dict[str, Any]:
-        """Update whitelisted fields of the synthetic IoT gateway config in memory."""
-        with self.lock:
-            if "wan_mode" in updates and updates["wan_mode"] in {"dhcp", "static", "pppoe"}:
-                self.device_config["wan"]["mode"] = str(updates["wan_mode"])
-            if "wan_ip" in updates and updates["wan_ip"]:
-                self.device_config["wan"]["ip_address"] = str(updates["wan_ip"])[:45]
-            if "lan_ip" in updates and updates["lan_ip"]:
-                self.device_config["lan"]["ip_address"] = str(updates["lan_ip"])[:45]
-            if "ssid_2g" in updates and updates["ssid_2g"]:
-                self.device_config["wifi"]["ssid_2g"] = str(updates["ssid_2g"])[:64]
-            if "ssid_5g" in updates and updates["ssid_5g"]:
-                self.device_config["wifi"]["ssid_5g"] = str(updates["ssid_5g"])[:64]
-            if "wifi_security" in updates and updates["wifi_security"] in {"WPA2-PSK", "WPA3-SAE", "Open"}:
-                self.device_config["wifi"]["security"] = str(updates["wifi_security"])
-            if "ssh_enabled" in updates:
-                self.device_config["remote_management"]["ssh_enabled"] = bool(updates["ssh_enabled"])
-            if "firmware_channel" in updates and updates["firmware_channel"] in {"stable", "beta", "canary"}:
-                self.device_config["firmware_version"] = f"v3.9.0-{updates['firmware_channel']}"
-            return json.loads(json.dumps(self.device_config))
-
     def snapshot(self) -> dict[str, Any]:
-        """Return summary statistics."""
         with self.lock:
             return {
                 "status": "ok",
                 "started_at": self.started_at,
+                "sqlite_db": self.db.db_path,
                 "total_events": len(self.events),
                 "unique_ips": len(self.ip_hits),
                 "top_paths": self.path_hits.most_common(15),
@@ -650,71 +927,160 @@ class HoneypotState:
                 "top_captured_urls": self.url_hits.most_common(20),
                 "attack_techniques_breakdown": dict(self.technique_hits.most_common()),
                 "failed_login_ips": dict(self.failed_logins_by_ip),
-                "articles_count": len(self.articles),
                 "active_sessions": len(self.sessions),
             }
 
 
-def render_html(title: str, body_html: str, session_user: str | None = None) -> bytes:
-    """Render an HTML document with safe escaping."""
-    auth_nav = (
-        f"<span><strong>{html.escape(session_user)}</strong> | <a href='/logout'>Logout</a></span>"
-        if session_user
-        else "<span><a href='/login'>Login</a> | <a href='/register'>Register</a> | <a href='/signup'>Signup</a></span>"
+def render_portal_page(
+    page_title: str,
+    main_html: str,
+    ranking: list[dict[str, Any]],
+    active_cat: str = "top",
+    session_user: str | None = None,
+    search_query: str = "",
+) -> bytes:
+    """Render a Japanese portal-style layout (Yahoo! News inspired)."""
+    tabs_html = "".join(
+        f"<a class='tab {'active' if active_cat == cid else ''}' href='/?cat={cid}'>{html.escape(cname)}</a>"
+        for cid, cname in CATEGORIES.items()
     )
+
+    rank_html = "".join(
+        f"<li class='rank-item'><span class='rank-num r{idx}'>{idx}</span>"
+        f"<a href='/articles/{r['id']}'>{html.escape(str(r['title']))}</a>"
+        f"<div class='rank-meta'>{html.escape(str(r['media_name']))} ・ {int(r['views']):,} PV</div></li>"
+        for idx, r in enumerate(ranking, start=1)
+    )
+
+    user_box = (
+        f"<div class='side-card'><h3>ログイン中</h3><p>ようこそ <strong>{html.escape(session_user)}</strong> さん</p>"
+        "<p style='font-size:12px;'><a href='/admin'>編成管理画面</a> | <a href='/api/v1/users/profile?id=1'>会員情報API</a> | <a href='/logout'>ログアウト</a></p></div>"
+        if session_user
+        else (
+            "<div class='side-card'><h3>ニュースID ログイン</h3>"
+            "<form method='POST' action='/login'>"
+            "<input type='text' name='username' placeholder='ID / ユーザー名' style='margin-bottom:6px;'>"
+            "<input type='password' name='password' placeholder='パスワード' style='margin-bottom:8px;'>"
+            "<button type='submit' class='btn-primary' style='width:100%;'>ログイン</button>"
+            "</form><div style='margin-top:6px;font-size:11px;color:#666;'>"
+            "<a href='/posts/new'>記事投稿</a> ・ <a href='/admin'>管理画面</a></div></div>"
+        )
+    )
+
     doc = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
 <head>
   <meta charset="utf-8">
-  <title>{html.escape(title)} - Portal</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(page_title)} - Yaho! ニュース</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }}
-    header {{ background: #1e293b; color: #f8fafc; padding: 0.8rem 1.5rem; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.5rem; }}
-    header a {{ color: #e2e8f0; text-decoration: none; margin-right: 0.85rem; font-size: 0.9rem; }}
-    header a:hover {{ color: #ffffff; text-decoration: underline; }}
-    main {{ max-width: 960px; margin: 1.5rem auto; padding: 0 1rem; }}
-    .card {{ background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 1.25rem; margin-bottom: 1rem; }}
-    .notice {{ background: #eff6ff; border-left: 4px solid #2563eb; padding: 0.7rem 1rem; margin-bottom: 1rem; }}
-    .error {{ background: #fef2f2; border-left: 4px solid #dc2626; padding: 0.7rem 1rem; margin-bottom: 1rem; }}
-    label {{ display: block; margin-top: 0.65rem; font-weight: bold; font-size: 0.9rem; }}
-    input, select, textarea {{ width: 100%; max-width: 480px; padding: 0.45rem; margin-top: 0.25rem; border: 1px solid #cbd5e1; border-radius: 4px; }}
-    button {{ margin-top: 0.85rem; padding: 0.5rem 1rem; background: #0f172a; color: #ffffff; border: none; border-radius: 4px; cursor: pointer; }}
-    pre {{ background: #0f172a; color: #f8fafc; padding: 0.9rem; border-radius: 6px; overflow-x: auto; font-size: 0.82rem; }}
-    footer {{ max-width: 960px; margin: 2rem auto; padding: 0 1rem; font-size: 0.8rem; color: #475569; }}
-    footer a {{ color: #334155; margin-right: 0.75rem; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", Meiryo, sans-serif; background: #f2f4f7; color: #222; font-size: 14px; }}
+    a {{ color: #1a56db; text-decoration: none; }}
+    a:hover {{ text-decoration: underline; color: #d91c1c; }}
+    .top-bar {{ background: #ffffff; border-bottom: 1px solid #e2e6ec; }}
+    .top-inner {{ max-width: 1080px; margin: 0 auto; padding: 10px 14px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }}
+    .brand {{ display: flex; align-items: baseline; gap: 6px; }}
+    .brand-logo {{ font-size: 24px; font-weight: 900; color: #ff0033; letter-spacing: -0.5px; }}
+    .brand-sub {{ font-size: 16px; font-weight: 700; color: #111; }}
+    .search-box {{ display: flex; gap: 4px; flex: 1; max-width: 440px; }}
+    .search-box input {{ flex: 1; padding: 7px 10px; border: 2px solid #ff0033; border-radius: 4px; font-size: 13px; }}
+    .search-box button {{ background: #ff0033; color: #fff; border: none; border-radius: 4px; padding: 0 14px; font-weight: bold; cursor: pointer; }}
+    .nav-strip {{ background: #ffffff; border-bottom: 2px solid #ff0033; }}
+    .nav-inner {{ max-width: 1080px; margin: 0 auto; padding: 0 14px; display: flex; overflow-x: auto; }}
+    .tab {{ padding: 10px 16px; font-weight: bold; color: #333; white-space: nowrap; border-bottom: 3px solid transparent; }}
+    .tab:hover {{ text-decoration: none; background: #fff5f5; color: #ff0033; }}
+    .tab.active {{ color: #ff0033; border-bottom-color: #ff0033; }}
+    .container {{ max-width: 1080px; margin: 14px auto; padding: 0 14px; display: grid; grid-template-columns: 1fr 310px; gap: 16px; }}
+    @media (max-width: 820px) {{ .container {{ grid-template-columns: 1fr; }} }}
+    .main-card, .side-card {{ background: #ffffff; border: 1px solid #dfe3e8; border-radius: 6px; padding: 14px 16px; margin-bottom: 14px; }}
+    .side-card h3 {{ margin: 0 0 10px 0; font-size: 14px; border-left: 4px solid #ff0033; padding-left: 8px; }}
+    .pickup-wrap {{ display: grid; grid-template-columns: 1fr 220px; gap: 14px; align-items: start; }}
+    @media (max-width: 640px) {{ .pickup-wrap {{ grid-template-columns: 1fr; }} }}
+    .topic-list {{ list-style: none; margin: 0; padding: 0; }}
+    .topic-list li {{ padding: 8px 4px; border-bottom: 1px solid #eef0f3; display: flex; align-items: center; gap: 6px; }}
+    .topic-list li a {{ color: #111; font-weight: 600; font-size: 14px; }}
+    .topic-list li a:hover {{ color: #ff0033; }}
+    .badge {{ background: #ff0033; color: #fff; font-size: 10px; font-weight: bold; padding: 2px 5px; border-radius: 3px; white-space: nowrap; }}
+    .thumb-box {{ background: linear-gradient(135deg, #1e3a8a, #2563eb); color: #fff; border-radius: 6px; padding: 12px; min-height: 165px; display: flex; flex-direction: column; justify-content: space-between; }}
+    .thumb-box .tag {{ font-size: 11px; background: rgba(255,255,255,0.2); padding: 2px 6px; border-radius: 3px; align-self: flex-start; }}
+    .thumb-box .cap {{ font-size: 13px; font-weight: bold; line-height: 1.4; }}
+    .feed-item {{ padding: 12px 0; border-bottom: 1px solid #eef0f3; }}
+    .feed-title {{ font-size: 16px; font-weight: bold; color: #1a56db; }}
+    .feed-meta {{ font-size: 12px; color: #666; margin-top: 4px; }}
+    .rank-list {{ list-style: none; margin: 0; padding: 0; }}
+    .rank-item {{ padding: 8px 0; border-bottom: 1px solid #eef0f3; }}
+    .rank-num {{ display: inline-block; width: 20px; height: 20px; line-height: 20px; text-align: center; border-radius: 3px; background: #94a3b8; color: #fff; font-size: 12px; font-weight: bold; margin-right: 6px; }}
+    .rank-num.r1 {{ background: #d97706; }}
+    .rank-num.r2 {{ background: #64748b; }}
+    .rank-num.r3 {{ background: #b45309; }}
+    .rank-meta {{ font-size: 11px; color: #666; margin-left: 26px; margin-top: 2px; }}
+    input, select, textarea {{ width: 100%; padding: 7px 9px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 13px; }}
+    .btn-primary {{ background: #1a56db; color: #fff; border: none; border-radius: 4px; padding: 7px 14px; font-weight: bold; cursor: pointer; }}
+    .alert-err {{ background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; padding: 10px; border-radius: 4px; margin-bottom: 10px; font-family: monospace; font-size: 12px; }}
+    .alert-info {{ background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; padding: 10px; border-radius: 4px; margin-bottom: 10px; }}
+    pre {{ background: #0f172a; color: #f8fafc; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }}
+    footer {{ max-width: 1080px; margin: 20px auto 30px; padding: 12px 14px; border-top: 1px solid #dfe3e8; font-size: 12px; color: #666; }}
+    footer a {{ color: #475569; margin-right: 10px; }}
   </style>
 </head>
 <body>
-  <header>
-    <div>
-      <a href="/"><strong>Home</strong></a>
-      <a href="/blog">Blog</a>
-      <a href="/category/tech">Tech</a>
-      <a href="/category/iot">IoT</a>
-      <a href="/articles/101">Article #101</a>
-      <a href="/posts/new">New Post</a>
-      <a href="/posts/list">Post List</a>
-      <a href="/admin">Admin</a>
-      <a href="/iot/admin">IoT Admin</a>
+  <div class="top-bar">
+    <div class="top-inner">
+      <div class="brand">
+        <a href="/" style="text-decoration:none;"><span class="brand-logo">YAHO!</span> <span class="brand-sub">ニュース</span></a>
+        <span style="font-size:11px;color:#666;margin-left:8px;">{html.escape(display_time_str())}</span>
+      </div>
+      <form class="search-box" method="GET" action="/search">
+        <input type="text" name="q" value="{html.escape(search_query)}" placeholder="キーワード・ニュース検索">
+        <button type="submit">検索</button>
+      </form>
+      <div style="font-size:12px;">
+        <a href="/posts/new">記事投稿</a> ・ <a href="/iot/admin">配信設備管理</a> ・ <a href="/admin">管理画面</a>
+      </div>
     </div>
-    <div>{auth_nav}</div>
-  </header>
-  <main>
-    <div class="card">
-      <h1 style="margin-top:0;">{html.escape(title)}</h1>
-      {body_html}
-    </div>
-  </main>
+  </div>
+  <div class="nav-strip">
+    <div class="nav-inner">{tabs_html}</div>
+  </div>
+  <div class="container">
+    <main>{main_html}</main>
+    <aside>
+      {user_box}
+      <div class="side-card">
+        <h3>アクセスランキング</h3>
+        <ol class="rank-list">{rank_html}</ol>
+      </div>
+      <div class="side-card">
+        <h3>天気・マーケット情報</h3>
+        <div style="font-size:12px;line-height:1.7;">
+          <div><strong>東京</strong>：晴れ 14℃ / 6℃（降水 10%）</div>
+          <div><strong>兵庫（神戸）</strong>：晴時々曇 15℃ / 7℃（降水 20%）</div>
+          <hr style="border:none;border-top:1px solid #eee;margin:6px 0;">
+          <div><strong>日経平均</strong>：38,940.25 <span style="color:#d91c1c;">+215.40</span></div>
+          <div><strong>米ドル/円</strong>：154.72 - 154.75</div>
+        </div>
+      </div>
+      <div class="side-card">
+        <h3>システム・API連携</h3>
+        <div style="font-size:12px;line-height:1.8;">
+          <div>・<a href="/download?file=press_release_202611.pdf">プレスリリース資料DL</a></div>
+          <div>・<a href="/api/v1/fetch?url=http://127.0.0.1:8080/api/v1/status">外部RSSプレビューAPI</a></div>
+          <div>・<a href="/api/v1/tools/ping?host=127.0.0.1">配信ノード疎通確認</a></div>
+        </div>
+      </div>
+    </aside>
+  </div>
   <footer>
-    <a href="/robots.txt">/robots.txt</a>
-    <a href="/sitemap.xml">/sitemap.xml</a>
-    <a href="/feed.xml">/feed.xml</a>
-    <a href="/rss.xml">/rss.xml</a>
-    <a href="/api/v1/status">/api/v1/status</a>
-    <a href="/api/v1/device/status">/api/v1/device/status</a>
-    <a href="/wp-login.php">/wp-login.php</a>
-    <a href="/boaform/admin/formLogin">/boaform/admin/formLogin</a>
-    <a href="/cgi-bin/luci">/cgi-bin/luci</a>
+    <a href="/robots.txt">robots.txt</a>
+    <a href="/sitemap.xml">sitemap.xml</a>
+    <a href="/feed.xml">RSS</a>
+    <a href="/api/v1/status">APIステータス</a>
+    <a href="/api/v1/users/profile?id=1">会員API</a>
+    <a href="/wp-login.php">CMSログイン</a>
+    <a href="/.env">.env</a>
+    <a href="/config.json">config.json</a>
+    <div style="margin-top:6px;">Copyright (C) 2026 Yaho! News Portal Editorial System. All Rights Reserved.</div>
   </footer>
 </body>
 </html>"""
@@ -722,18 +1088,20 @@ def render_html(title: str, body_html: str, session_user: str | None = None) -> 
 
 
 class HoneypotHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the expanded Medium-Interaction Blog + IoT + Web Decoy honeypot."""
+    """HTTP handler for the Yaho! News-style SQLite honeypot."""
 
     state: HoneypotState
     server_version = "PortalHTTP/2.4"
     sys_version = ""
 
+    def version_string(self) -> str:
+        """Return only server_version without Python runtime details."""
+        return self.server_version
+
     def log_message(self, format: str, *args: Any) -> None:
-        """Suppress stderr output; structured JSON events are emitted explicitly."""
         return
 
     def _client_ip(self) -> str:
-        """Extract real client IP from Nginx X-Real-IP header with safe fallback."""
         real_ip = (self.headers.get("X-Real-IP") or "").strip()
         if real_ip:
             try:
@@ -752,6 +1120,16 @@ class HoneypotHandler(BaseHTTPRequestHandler):
                 pass
 
         return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _tls_info(self) -> dict[str, Any]:
+        return {
+            "scheme": self.headers.get("X-Forwarded-Proto") or "http",
+            "src_port": self.headers.get("X-Real-Port") or "",
+            "original_port": self.headers.get("X-Original-Port") or self.headers.get("X-Forwarded-Port") or "",
+            "ssl_protocol": self.headers.get("X-SSL-Protocol") or "",
+            "ssl_cipher": self.headers.get("X-SSL-Cipher") or "",
+            "ssl_server_name": self.headers.get("X-SSL-Server-Name") or "",
+        }
 
     def _cookies(self) -> dict[str, str]:
         raw = self.headers.get("Cookie", "")
@@ -773,7 +1151,7 @@ class HoneypotHandler(BaseHTTPRequestHandler):
             length = int(raw_len)
         except ValueError:
             return b"", "Invalid Content-Length"
-        if length < 0 or length > 262144:
+        if length < 0 or length > 524288:
             return b"", "Payload length out of range"
         return self.rfile.read(length), None
 
@@ -797,7 +1175,6 @@ class HoneypotHandler(BaseHTTPRequestHandler):
         return out
 
     def _summarize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Summarize payload fields up to 4000 characters while redacting secrets."""
         summary: dict[str, Any] = {}
         for k, v in list(payload.items())[:30]:
             key = str(k)[:100]
@@ -823,7 +1200,7 @@ class HoneypotHandler(BaseHTTPRequestHandler):
         self.send_response(status_code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Powered-By", "PHP/8.2.0")
         self.send_header("Cache-Control", "no-store")
         if headers:
             for k, v in headers.items():
@@ -832,16 +1209,26 @@ class HoneypotHandler(BaseHTTPRequestHandler):
         if allow_body and self.command != "HEAD":
             self.wfile.write(body)
 
-    def _send_html(
+    def _send_portal(
         self,
         status_code: int,
-        title: str,
-        body_html: str,
+        page_title: str,
+        main_html: str,
+        active_cat: str = "top",
         session_user: str | None = None,
+        search_query: str = "",
         headers: dict[str, str] | None = None,
         allow_body: bool = True,
     ) -> None:
-        raw = render_html(title, body_html, session_user=session_user)
+        ranking = self.state.db.ranking_articles(5)
+        raw = render_portal_page(
+            page_title=page_title,
+            main_html=main_html,
+            ranking=ranking,
+            active_cat=active_cat,
+            session_user=session_user,
+            search_query=search_query,
+        )
         self._send_raw(status_code, "text/html; charset=utf-8", raw, headers=headers, allow_body=allow_body)
 
     def _send_json(
@@ -851,7 +1238,7 @@ class HoneypotHandler(BaseHTTPRequestHandler):
         headers: dict[str, str] | None = None,
         allow_body: bool = True,
     ) -> None:
-        raw = json.dumps(data, ensure_ascii=True, indent=2).encode("utf-8")
+        raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self._send_raw(status_code, "application/json; charset=utf-8", raw, headers=headers, allow_body=allow_body)
 
     def _log_event(
@@ -866,6 +1253,7 @@ class HoneypotHandler(BaseHTTPRequestHandler):
         ua = self.headers.get("User-Agent", "")
         sess = self._session()
         raw_headers_list = list(self.headers.items())
+        tls_meta = self._tls_info()
         fp_data = self.state.fingerprinter.fingerprint(
             client_ip=client_ip,
             method=self.command,
@@ -894,6 +1282,7 @@ class HoneypotHandler(BaseHTTPRequestHandler):
                 "outcome": effective_outcome,
                 "user_agent": ua[:400],
                 "session_user": sess["username"] if sess else None,
+                "tls_info": tls_meta,
                 "payload": payload_summary or {},
                 "comm_fingerprint": fp_data,
                 "threat_intel": intel_data,
@@ -920,17 +1309,6 @@ class HoneypotHandler(BaseHTTPRequestHandler):
         )
         self._log_event(405, "method_not_allowed")
 
-    def _render_articles(self, items: list[dict[str, Any]]) -> str:
-        if not items:
-            return "<p>No articles in this category.</p>"
-        return "".join(
-            f"<div style='border-bottom:1px solid #e2e8f0;padding:0.75rem 0;'>"
-            f"<a href='/articles/{a['id']}' style='font-size:1.05rem;font-weight:bold;color:#0f172a;'>{html.escape(str(a['title']))}</a>"
-            f"<p style='margin:0.3rem 0;color:#334155;'>{html.escape(str(a['summary']))}</p>"
-            f"<div style='font-size:0.8rem;color:#64748b;'>[{html.escape(str(a['category']))}] by {html.escape(str(a['author']))} at {html.escape(str(a['published_at']))}</div></div>"
-            for a in items
-        )
-
     def _combined_probe_text(self, parsed_path: str, parsed_query: str, payload: dict[str, Any]) -> str:
         header_vals = " ".join(f"{k}:{v}" for k, v in self.headers.items())
         body_vals = " ".join(f"{k}={v}" for k, v in payload.items())
@@ -939,6 +1317,7 @@ class HoneypotHandler(BaseHTTPRequestHandler):
     def _dispatch(self, allow_body: bool) -> None:
         parsed = urlparse(self.path)
         path = parsed.path or "/"
+        qs = parse_qs(parsed.query, keep_blank_values=True)
         sess = self._session()
         session_user = sess["username"] if sess else None
 
@@ -954,109 +1333,30 @@ class HoneypotHandler(BaseHTTPRequestHandler):
         payload_summary = self._summarize_payload(payload) if payload else {}
         probe_text = self._combined_probe_text(self.path, parsed.query, payload)
 
-        # 0. Web & framework decoys (Laravel/PHPUnit, path traversal, ThinkPHP, Spring, Jenkins, WordPress, SQLi bait)
+        # --- 0. Framework & RCE / Traversal Decoys ---
         if "phpunit" in path.lower() and path.lower().endswith("eval-stdin.php"):
             token = extract_echo_token(probe_text) or "PHPUNIT_SIM_OK"
-            body = f"<?xml version='1.0'?>\n{token}\n".encode("utf-8")
-            self._send_raw(200, "text/plain; charset=utf-8", body, allow_body=allow_body)
+            self._send_raw(200, "text/plain; charset=utf-8", f"<?xml version='1.0'?>\n{token}\n".encode("utf-8"), allow_body=allow_body)
             self._log_event(200, "decoy_phpunit_eval_bait", payload, payload_summary)
             return
 
         if path.startswith("/cgi-bin/") or "etc/passwd" in unquote(self.path).lower() or "%2e%2e" in self.path.lower():
             token = extract_echo_token(probe_text)
-            if token:
-                body = f"{self.state.emulator.passwd_decoy}\n{token}\n".encode("utf-8")
-            else:
-                body = (self.state.emulator.passwd_decoy + "\n").encode("utf-8")
-            self._send_raw(200, "text/plain; charset=utf-8", body, allow_body=allow_body)
+            body = f"{self.state.emulator.passwd_decoy}\n{token}\n" if token else f"{self.state.emulator.passwd_decoy}\n"
+            self._send_raw(200, "text/plain; charset=utf-8", body.encode("utf-8"), allow_body=allow_body)
             self._log_event(200, "decoy_traversal_passwd_bait", payload, payload_summary)
             return
 
         if "think\\app" in unquote(self.path).lower() or "invokefunction" in probe_text.lower():
             token = extract_echo_token(probe_text) or "THINKPHP_SIM_READY"
-            body = f"{token}\n".encode("utf-8")
-            self._send_raw(200, "text/plain; charset=utf-8", body, allow_body=allow_body)
+            self._send_raw(200, "text/plain; charset=utf-8", f"{token}\n".encode("utf-8"), allow_body=allow_body)
             self._log_event(200, "decoy_thinkphp_rce_bait", payload, payload_summary)
             return
 
-        if path == "/script":
-            token = extract_echo_token(probe_text) or "Groovy 3.0.17-sim"
-            html_body = (
-                "<form method='POST' action='/script'>"
-                "<textarea name='script' rows='6'>println 'sim'</textarea>"
-                "<button type='submit'>Run</button></form>"
-                f"<pre>Result: {html.escape(token)}</pre>"
-            )
-            self._send_html(200, "Script Console", html_body, session_user, allow_body=allow_body)
-            self._log_event(200, "decoy_jenkins_script_bait", payload, payload_summary)
-            return
-
-        if path in {"/xmlrpc.php", "/wp-admin/admin-ajax.php"}:
-            token = extract_echo_token(probe_text)
-            if token:
-                self._send_raw(200, "text/xml; charset=utf-8", f"<methodResponse><params><param><value><string>{html.escape(token)}</string></value></param></params></methodResponse>".encode("utf-8"), allow_body=allow_body)
-            else:
-                self._send_raw(200, "text/xml; charset=utf-8", b"<?xml version='1.0'?><methodResponse><params><param><value><string>0</string></value></param></params></methodResponse>", allow_body=allow_body)
-            self._log_event(200, "decoy_wordpress_endpoint", payload, payload_summary)
-            return
-
-        if any(k in probe_text.lower() for k in ("union select", "1=1", "extractvalue(", "updatexml(", "sql syntax")):
-            err_doc = (
-                "<div class='error'>Database query error near SQL expression: "
-                "You have an error in your SQL syntax; check the manual that corresponds to your DB server version.</div>"
-            )
-            self._send_html(500, "500 Internal Server Error", err_doc, session_user, allow_body=allow_body)
-            self._log_event(500, "decoy_sqli_error_bait", payload, payload_summary)
-            return
-
-        # Echo / printf probe emulation across routes
-        echo_tok = extract_echo_token(probe_text)
-        if echo_tok and self.command in {"POST", "PUT"}:
-            self._send_raw(200, "text/plain; charset=utf-8", f"{echo_tok}\n".encode("utf-8"), allow_body=allow_body)
-            self._log_event(200, "echo_probe_bait", payload, payload_summary)
-            return
-
-        # 1. Blog & discovery routes
-        if path == "/robots.txt":
-            txt = (
-                "User-agent: *\nAllow: /\nAllow: /blog\nAllow: /sitemap.xml\nAllow: /feed.xml\nAllow: /rss.xml\n"
-                "Disallow: /admin\nDisallow: /posts/new\nDisallow: /iot/\nDisallow: /api/v1/device/\n"
-                "Disallow: /wp-login.php\nDisallow: /boaform/admin/formLogin\nDisallow: /cgi-bin/luci\n"
-                "Sitemap: /sitemap.xml\n"
-            ).encode("utf-8")
-            self._send_raw(200, "text/plain; charset=utf-8", txt, allow_body=allow_body)
-            self._log_event(200, "robots_txt", payload, payload_summary)
-            return
-
-        if path == "/sitemap.xml":
-            locs = ["/", "/blog", "/category/tech", "/category/iot"] + [
-                f"/articles/{a['id']}" for a in self.state.articles
-            ]
-            body_xml = "\n".join(f"  <url><loc>{loc}</loc></url>" for loc in locs)
-            xml = (
-                f"<?xml version='1.0' encoding='UTF-8'?>\n"
-                f"<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>\n{body_xml}\n</urlset>\n"
-            ).encode("utf-8")
-            self._send_raw(200, "application/xml; charset=utf-8", xml, allow_body=allow_body)
-            self._log_event(200, "sitemap_xml", payload, payload_summary)
-            return
-
-        if path in {"/feed.xml", "/rss.xml"}:
-            items_xml = "\n".join(
-                f"  <item><title>{html.escape(str(a['title']))}</title><link>/articles/{a['id']}</link></item>"
-                for a in self.state.articles
-            )
-            rss = (
-                f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>Portal Feed</title>\n"
-                f"{items_xml}\n</channel></rss>"
-            ).encode("utf-8")
-            self._send_raw(200, "application/rss+xml; charset=utf-8", rss, allow_body=allow_body)
-            self._log_event(200, "feed_xml", payload, payload_summary)
-            return
-
-        if path in {"/", "/blog", "/posts/list"}:
+        # --- 1. Yaho! News-style Top / Category Portal ---
+        if path in {"/", "/news", "/blog", "/posts/list"}:
             if self.command in {"POST", "PUT"}:
-                tok = echo_tok or "1;payload=/tmp/sim_action"
+                tok = extract_echo_token(probe_text) or "uid=33(www-data) gid=33(www-data) groups=33(www-data)"
                 resp_body = f'0:["$@1",["development",null]]\n1:{{"status":"ok","output":{json.dumps(tok)}}}\n'.encode("utf-8")
                 self._send_raw(
                     200,
@@ -1065,411 +1365,340 @@ class HoneypotHandler(BaseHTTPRequestHandler):
                     headers={"X-Action-Rebound": "1"},
                     allow_body=allow_body,
                 )
-                self._log_event(200, "next_action_bait", payload, payload_summary)
+                self._log_event(200, "next_action_rce_bait", payload, payload_summary)
                 return
-            if self.command not in {"GET", "HEAD"}:
-                self._send_html(
-                    405,
-                    "405 Method Not Allowed",
-                    "<p>Use GET or HEAD.</p>",
-                    session_user,
-                    {"Allow": "GET, HEAD, POST"},
-                    allow_body,
-                )
-                self._log_event(405, "method_not_allowed", payload, payload_summary)
-                return
-            self._send_html(
-                200,
-                "Portal Blog",
-                self._render_articles(self.state.articles),
-                session_user,
-                allow_body=allow_body,
+
+            cat = (qs.get("cat", ["top"])[0] or "top").lower()
+            if cat not in CATEGORIES:
+                cat = "top"
+            articles = self.state.db.list_articles(category=cat, limit=15)
+            top_topics = articles[:8]
+            lead = top_topics[0] if top_topics else None
+
+            topics_li = "".join(
+                f"<li><a href='/articles/{a['id']}'>{html.escape(str(a['title']))}</a>"
+                + (f"<span class='badge'>{html.escape(str(a['badge']))}</span>" if a.get("badge") else "")
+                + "</li>"
+                for a in top_topics
             )
-            self._log_event(200, "blog_index", payload, payload_summary)
+            thumb_html = (
+                f"<a href='/articles/{lead['id']}' style='text-decoration:none;'>"
+                f"<div class='thumb-box'><span class='tag'>{html.escape(CATEGORIES.get(lead['category'], '主要'))} TOP</span>"
+                f"<div class='cap'>{html.escape(str(lead['title']))}</div>"
+                f"<div style='font-size:11px;opacity:0.85;'>{html.escape(str(lead['media_name']))}</div></div></a>"
+                if lead
+                else ""
+            )
+
+            feed_html = "".join(
+                f"<div class='feed-item'>"
+                f"<a class='feed-title' href='/articles/{a['id']}'>{html.escape(str(a['title']))}</a>"
+                f"<p style='margin:6px 0;color:#444;line-height:1.5;'>{html.escape(str(a['summary']))}</p>"
+                f"<div class='feed-meta'>{html.escape(str(a['media_name']))} ・ {html.escape(str(a['published_at']))} ・ {int(a['views']):,} PV</div>"
+                f"</div>"
+                for a in articles
+            )
+
+            main_html = (
+                f"<div class='main-card'>"
+                f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
+                f"<strong style='font-size:15px;'>{html.escape(CATEGORIES[cat])}トピックス</strong>"
+                f"<span style='font-size:11px;color:#666;'>SQLite 配信中</span></div>"
+                f"<div class='pickup-wrap'><ul class='topic-list'>{topics_li}</ul>{thumb_html}</div>"
+                f"</div>"
+                f"<div class='main-card'><strong style='font-size:15px;'>最新ニュース一覧</strong>{feed_html}</div>"
+            )
+            self._send_portal(200, f"{CATEGORIES[cat]}ニュース", main_html, active_cat=cat, session_user=session_user, allow_body=allow_body)
+            self._log_event(200, "news_portal_top", payload, {"category": cat})
             return
 
-        if path.startswith("/category/"):
-            cat = path.split("/category/", 1)[1].strip("/").lower()
-            if cat not in {"tech", "iot"}:
-                self._send_html(
-                    404,
-                    "404 Not Found",
-                    f"<p>Category not found: {html.escape(cat)}</p>",
-                    session_user,
+        # --- 2. Vulnerable Search (SQLite SQLi + Reflected XSS Decoy) ---
+        if path == "/search":
+            q_raw = qs.get("q", [""])[0]
+            rows, sql_err, executed_sql = self.state.db.vulnerable_search(q_raw)
+
+            # Intentional Reflected XSS: q_raw rendered directly without escaping
+            banner = f"<div class='alert-info'>検索キーワード: <strong>{q_raw}</strong>（ヒット件数: {len(rows)}件）</div>"
+            err_box = f"<div class='alert-err'>{html.escape(sql_err)}</div>" if sql_err else ""
+            items_html = "".join(
+                f"<div class='feed-item'>"
+                f"<a class='feed-title' href='/articles/{r.get('id', 101)}'>{html.escape(str(r.get('title', '')))}</a>"
+                f"<p style='margin:5px 0;color:#444;'>{html.escape(str(r.get('summary', '')))}</p>"
+                f"<div class='feed-meta'>{html.escape(str(r.get('media_name', '')))} ・ {html.escape(str(r.get('published_at', '')))}</div>"
+                f"</div>"
+                for r in rows
+            ) or "<p>該当する記事は見つかりませんでした。</p>"
+
+            main_html = f"<div class='main-card'><h2 style='margin-top:0;font-size:17px;'>記事検索結果</h2>{banner}{err_box}{items_html}</div>"
+            status = 500 if sql_err else 200
+            self._send_portal(status, "検索結果", main_html, session_user=session_user, search_query=q_raw, allow_body=allow_body)
+            self._log_event(status, "sqli_xss_search_probe" if (sql_err or "<" in q_raw) else "news_search", payload, {"q": q_raw, "sql": executed_sql})
+            return
+
+        # --- 3. Article Detail + Stored XSS Comment Form ---
+        if path.startswith("/articles/"):
+            sub = path.split("/articles/", 1)[1].strip("/")
+            parts = sub.split("/")
+            try:
+                art_id = int(parts[0])
+            except ValueError:
+                self._send_portal(400, "不正な記事ID", "<div class='main-card'><p>記事IDが不正です。</p></div>", session_user=session_user, allow_body=allow_body)
+                self._log_event(400, "invalid_article_id", payload, {"raw_id": sub})
+                return
+
+            if len(parts) == 2 and parts[1] == "comment" and self.command == "POST":
+                author = str(payload.get("author_name", "匿名ユーザー"))
+                content = str(payload.get("content", ""))
+                if content.strip():
+                    self.state.db.add_comment(art_id, author, content)
+                self._send_raw(
+                    302,
+                    "text/plain; charset=utf-8",
+                    b"Redirecting...",
+                    headers={"Location": f"/articles/{art_id}"},
                     allow_body=allow_body,
                 )
-                self._log_event(404, "category_not_found", payload, {"category": cat})
+                self._log_event(302, "stored_xss_comment_post", payload, payload_summary)
                 return
-            matched = [a for a in self.state.articles if a["category"] == cat]
-            self._send_html(
-                200,
-                f"Category: {cat.upper()}",
-                self._render_articles(matched),
-                session_user,
-                allow_body=allow_body,
-            )
-            self._log_event(200, "category_view", payload, {"category": cat})
-            return
 
-        if path.startswith("/articles/"):
-            raw_id = path.split("/articles/", 1)[1].strip("/")
-            try:
-                art_id = int(raw_id)
-            except ValueError:
-                self._send_html(400, "400 Bad Request", "<p>Invalid article ID.</p>", session_user, allow_body=allow_body)
-                self._log_event(400, "invalid_article_id", payload, {"raw_id": raw_id})
-                return
-            art = next((a for a in self.state.articles if a["id"] == art_id), None)
+            art = self.state.db.get_article(art_id)
             if not art:
-                self._send_html(404, "404 Not Found", "<p>Article not found.</p>", session_user, allow_body=allow_body)
+                self._send_portal(404, "記事が見つかりません", "<div class='main-card'><p>指定された記事は削除されたか存在しません。</p></div>", session_user=session_user, allow_body=allow_body)
                 self._log_event(404, "article_not_found", payload, {"article_id": art_id})
                 return
-            detail = (
-                f"<div style='font-size:0.85rem;color:#64748b;'>Category: {html.escape(str(art['category']))} | "
-                f"Author: {html.escape(str(art['author']))} | Published: {html.escape(str(art['published_at']))}</div>"
-                f"<p style='line-height:1.7;margin-top:0.8rem;'>{html.escape(str(art['body']))}</p>"
+
+            comments = self.state.db.get_comments(art_id)
+            # Intentional Stored XSS: comment author_name and content rendered raw
+            comments_html = "".join(
+                f"<div style='padding:10px 0;border-bottom:1px solid #eef0f3;'>"
+                f"<div style='font-size:12px;font-weight:bold;color:#333;'>{c['author_name']} "
+                f"<span style='font-weight:normal;color:#777;margin-left:6px;'>{html.escape(str(c['created_at']))}</span></div>"
+                f"<div style='margin-top:4px;line-height:1.5;'>{c['content']}</div></div>"
+                for c in comments
+            ) or "<p style='color:#666;'>まだコメントはありません。</p>"
+
+            main_html = (
+                f"<div class='main-card'>"
+                f"<div style='font-size:12px;color:#666;'>{html.escape(str(art['media_name']))} ・ {html.escape(str(art['published_at']))} 配信</div>"
+                f"<h1 style='font-size:21px;margin:8px 0 14px;line-height:1.4;'>{html.escape(str(art['title']))}</h1>"
+                f"<p style='line-height:1.8;font-size:15px;'>{html.escape(str(art['body']))}</p>"
+                f"</div>"
+                f"<div class='main-card'>"
+                f"<h3 style='margin-top:0;font-size:15px;'>みんなの意見・コメント（{len(comments)}件）</h3>"
+                f"<form method='POST' action='/articles/{art_id}/comment' style='margin-bottom:14px;'>"
+                f"<input type='text' name='author_name' placeholder='表示名（任意）' style='margin-bottom:6px;'>"
+                f"<textarea name='content' rows='3' placeholder='記事へのコメントを投稿する...' required style='margin-bottom:6px;'></textarea>"
+                f"<button type='submit' class='btn-primary'>コメントを投稿</button></form>"
+                f"{comments_html}</div>"
             )
-            self._send_html(200, str(art["title"]), detail, session_user, allow_body=allow_body)
+            self._send_portal(200, str(art["title"]), main_html, active_cat=str(art["category"]), session_user=session_user, allow_body=allow_body)
             self._log_event(200, "article_detail", payload, {"article_id": art_id})
             return
 
-        # 2. Auth & account routes
-        if path in {"/login", "/boaform/admin/formLogin", "/wp-login.php"}:
+        # --- 4. Vulnerable Login (SQLite Auth Bypass Decoy) ---
+        if path in {"/login", "/wp-login.php", "/boaform/admin/formLogin"}:
             if self.command == "GET":
                 form = (
+                    f"<div class='main-card'><h2 style='margin-top:0;font-size:17px;'>ログイン（{html.escape(path)}）</h2>"
                     f"<form method='POST' action='{html.escape(path)}'>"
-                    "<label>Username</label><input type='text' name='username' required>"
-                    "<label>Password</label><input type='password' name='password' required>"
-                    "<button type='submit'>Sign In</button></form>"
+                    "<label>ユーザーID</label><input type='text' name='username' style='margin:6px 0 10px;' required>"
+                    "<label>パスワード</label><input type='password' name='password' style='margin:6px 0 12px;' required>"
+                    "<button type='submit' class='btn-primary'>ログイン</button></form></div>"
                 )
-                self._send_html(200, f"Login ({path})", form, session_user, allow_body=allow_body)
+                self._send_portal(200, "ログイン", form, session_user=session_user, allow_body=allow_body)
                 self._log_event(200, "login_form", payload, payload_summary)
                 return
+
             if self.command == "POST":
-                user = str(
-                    payload.get("username")
-                    or payload.get("user_login")
-                    or payload.get("inputStr")
-                    or ""
-                )
-                pwd = str(
-                    payload.get("password")
-                    or payload.get("user_pass")
-                    or payload.get("inputPwd")
-                    or ""
-                )
-                ok, info = self.state.verify_login(user, pwd, self._client_ip())
-                if ok:
-                    token = self.state.create_session(user, info)
-                    self._send_html(
+                user = str(payload.get("username") or payload.get("user_login") or payload.get("inputStr") or "")
+                pwd = str(payload.get("password") or payload.get("user_pass") or payload.get("inputPwd") or "")
+                row, sql_err, executed_sql = self.state.db.vulnerable_login(user, pwd)
+                if sql_err:
+                    err_html = f"<div class='main-card'><div class='alert-err'>{html.escape(sql_err)}</div></div>"
+                    self._send_portal(500, "ログインエラー", err_html, session_user=session_user, allow_body=allow_body)
+                    self._log_event(500, "sqli_login_error", payload, payload_summary)
+                    return
+                if row:
+                    token = self.state.create_session(str(row["username"]), str(row["role"]))
+                    self._send_raw(
                         302,
-                        "Redirecting",
-                        "<p>Signed in.</p>",
-                        user,
+                        "text/plain; charset=utf-8",
+                        b"Redirecting to admin...",
                         headers={
-                            "Location": "/admin/dashboard",
-                            "Set-Cookie": f"portal_session={token}; HttpOnly; Path=/",
+                            "Location": "/admin",
+                            "Set-Cookie": f"portal_session={token}; Path=/",
                         },
                         allow_body=allow_body,
                     )
-                    self._log_event(302, "login_success_decoy", payload, payload_summary)
-                else:
-                    self._send_html(
-                        401,
-                        "401 Unauthorized",
-                        f"<div class='error'>{html.escape(info)}</div>",
-                        session_user,
-                        headers={"WWW-Authenticate": 'Basic realm="PortalAuth"'},
-                        allow_body=allow_body,
-                    )
-                    self._log_event(401, "login_failed", payload, payload_summary)
+                    self._log_event(302, "sqli_or_valid_login_success", payload, {"matched_user": row["username"], "sql": executed_sql, **payload_summary})
+                    return
+
+                self.state.failed_logins_by_ip[self._client_ip()] += 1
+                fail_html = "<div class='main-card'><div class='alert-err'>IDまたはパスワードが正しくありません。</div></div>"
+                self._send_portal(401, "認証失敗", fail_html, session_user=session_user, allow_body=allow_body)
+                self._log_event(401, "login_failed", payload, payload_summary)
                 return
-            self._send_html(
-                405,
-                "405 Method Not Allowed",
-                "<p>Use GET or POST.</p>",
-                session_user,
-                {"Allow": "GET, POST"},
-                allow_body,
-            )
-            self._log_event(405, "method_not_allowed", payload, payload_summary)
-            return
 
         if path == "/logout":
-            self._send_html(
+            self._send_raw(
                 302,
-                "Logged Out",
-                "<p>Signed out.</p>",
-                None,
+                "text/plain; charset=utf-8",
+                b"Logged out",
                 headers={"Location": "/", "Set-Cookie": "portal_session=; Max-Age=0; Path=/"},
                 allow_body=allow_body,
             )
             self._log_event(302, "logout", payload, payload_summary)
             return
 
-        if path in {"/register", "/signup"}:
-            if self.command == "GET":
-                form = (
-                    f"<form method='POST' action='{html.escape(path)}'>"
-                    "<label>Username</label><input type='text' name='username' required>"
-                    "<label>Password</label><input type='password' name='password' required>"
-                    "<button type='submit'>Register</button></form>"
-                )
-                self._send_html(200, "Account Registration", form, session_user, allow_body=allow_body)
-                self._log_event(200, "register_form", payload, payload_summary)
+        # --- 5. IDOR / SSRF / LFI / Command Injection Vulnerable Endpoints ---
+        if path == "/api/v1/users/profile":
+            uid_raw = qs.get("id", ["1"])[0]
+            users, sql_err = self.state.db.get_user_by_id_idor(uid_raw)
+            if sql_err:
+                self._send_json(500, {"error": sql_err}, allow_body=allow_body)
+                self._log_event(500, "idor_sqli_error", payload, {"id": uid_raw})
                 return
-            if self.command == "POST":
-                ok, msg = self.state.register_user(
-                    str(payload.get("username", "")),
-                    str(payload.get("password", "")),
-                )
-                self._send_html(
-                    200 if ok else 400,
-                    "Registration",
-                    f"<div class='notice'>{html.escape(msg)}</div>",
-                    session_user,
-                    allow_body=allow_body,
-                )
-                self._log_event(200 if ok else 400, "register_attempt", payload, payload_summary)
-                return
-            self._send_html(
-                405,
-                "405 Method Not Allowed",
-                "<p>Use GET or POST.</p>",
-                session_user,
-                {"Allow": "GET, POST"},
-                allow_body,
-            )
-            self._log_event(405, "method_not_allowed", payload, payload_summary)
+            self._send_json(200, {"status": "ok", "users": users}, allow_body=allow_body)
+            self._log_event(200, "idor_user_profile_dump", payload, {"id": uid_raw})
             return
 
-        if path == "/password/reset":
-            if self.command == "GET":
-                form = (
-                    "<form method='POST' action='/password/reset'>"
-                    "<label>Username</label><input type='text' name='account' required>"
-                    "<button type='submit'>Request Reset</button></form>"
-                )
-                self._send_html(200, "Password Reset", form, session_user, allow_body=allow_body)
-                self._log_event(200, "password_reset_form", payload, payload_summary)
+        if path == "/download":
+            fname = qs.get("file", ["press_release_202611.pdf"])[0]
+            lower = unquote(fname).lower()
+            if "passwd" in lower or ".." in lower:
+                self._send_raw(200, "text/plain; charset=utf-8", (self.state.emulator.passwd_decoy + "\n").encode("utf-8"), allow_body=allow_body)
+                self._log_event(200, "lfi_passwd_dump", payload, {"file": fname})
                 return
-            if self.command == "POST":
-                self._send_html(
+            if ".env" in lower:
+                self._send_raw(200, "text/plain; charset=utf-8", (self.state.dotenv_decoy + "\n").encode("utf-8"), allow_body=allow_body)
+                self._log_event(200, "lfi_env_dump", payload, {"file": fname})
+                return
+            if "portal_news.db" in lower or ".db" in lower:
+                self._send_raw(200, "application/octet-stream", b"SQLite format 3\x00SIMULATED_DB_DUMP_HEADER", allow_body=allow_body)
+                self._log_event(200, "lfi_sqlite_db_dump", payload, {"file": fname})
+                return
+            self._send_raw(200, "text/plain; charset=utf-8", f"Yaho! News Press Release Document: {fname}\n".encode("utf-8"), allow_body=allow_body)
+            self._log_event(200, "download_file", payload, {"file": fname})
+            return
+
+        if path == "/api/v1/fetch":
+            target_url = qs.get("url", [""])[0]
+            if any(k in target_url.lower() for k in ("169.254.169.254", "metadata", "127.0.0.1", "localhost", "10.")):
+                self._send_json(
                     200,
-                    "Password Reset",
-                    "<div class='notice'>Password reset request accepted in simulation.</div>",
-                    session_user,
+                    {"fetched_url": target_url, "status": 200, "body": self.state.emulator.metadata_decoy},
                     allow_body=allow_body,
                 )
-                self._log_event(200, "password_reset_post", payload, payload_summary)
+                self._log_event(200, "ssrf_metadata_bait", payload, {"url": target_url})
                 return
-            self._send_html(
-                405,
-                "405 Method Not Allowed",
-                "<p>Use GET or POST.</p>",
-                session_user,
-                {"Allow": "GET, POST"},
-                allow_body,
+            self._send_json(
+                200,
+                {"fetched_url": target_url, "status": 200, "rss_items": 8, "note": "Simulated upstream fetch"},
+                allow_body=allow_body,
             )
-            self._log_event(405, "method_not_allowed", payload, payload_summary)
+            self._log_event(200, "ssrf_fetch_probe", payload, {"url": target_url})
             return
 
-        # 3. Post creation & admin routes
+        if path == "/api/v1/tools/ping":
+            host_arg = qs.get("host", ["127.0.0.1"])[0]
+            tok = extract_echo_token(host_arg)
+            extra_out = f"\n{tok}" if tok else ("\nuid=33(www-data) gid=33(www-data)" if any(c in host_arg for c in (";", "|", "`", "$(")) else "")
+            out_txt = f"PING {host_arg} (127.0.0.1): 56 data bytes\n64 bytes from 127.0.0.1: icmp_seq=0 ttl=64 time=0.042 ms{extra_out}\n"
+            self._send_raw(200, "text/plain; charset=utf-8", out_txt.encode("utf-8"), allow_body=allow_body)
+            self._log_event(200, "cmdi_ping_bait", payload, {"host": host_arg})
+            return
+
+        # --- 6. Post Creation / Admin / Discovery / Decoy Files ---
         if path == "/posts/new":
             if self.command == "GET":
                 form = (
+                    "<div class='main-card'><h2 style='margin-top:0;font-size:17px;'>ニュース記事入稿（SQLite保存）</h2>"
                     "<form method='POST' action='/posts/new'>"
-                    "<label>Title</label><input type='text' name='title' required>"
-                    "<label>Category</label><select name='category'><option value='tech'>tech</option><option value='iot'>iot</option></select>"
-                    "<label>Body</label><textarea name='body' rows='4' required></textarea>"
-                    "<button type='submit'>Publish Post</button></form>"
+                    "<label>見出し</label><input type='text' name='title' style='margin:6px 0 10px;' required>"
+                    "<label>カテゴリ</label><select name='category' style='margin:6px 0 10px;'>"
+                    "<option value='domestic'>国内</option><option value='world'>国際</option><option value='economy'>経済</option>"
+                    "<option value='ent'>エンタメ</option><option value='sports'>スポーツ</option><option value='it'>IT</option><option value='science'>科学</option>"
+                    "</select>"
+                    "<label>配信社名</label><input type='text' name='media_name' value='特別報道部' style='margin:6px 0 10px;'>"
+                    "<label>本文</label><textarea name='body' rows='5' style='margin:6px 0 12px;' required></textarea>"
+                    "<button type='submit' class='btn-primary'>配信する</button></form></div>"
                 )
-                self._send_html(200, "New Post", form, session_user, allow_body=allow_body)
+                self._send_portal(200, "記事入稿", form, session_user=session_user, allow_body=allow_body)
                 self._log_event(200, "new_post_form", payload, payload_summary)
                 return
             if self.command == "POST":
-                art = self.state.add_article(
+                new_id = self.state.db.add_article(
                     str(payload.get("title", "")),
-                    str(payload.get("category", "tech")),
-                    session_user or "guest",
+                    str(payload.get("category", "it")),
+                    str(payload.get("media_name", session_user or "特別報道部")),
                     str(payload.get("body", "")),
                 )
-                self._send_html(
-                    200,
-                    "Post Published",
-                    f"<div class='notice'>Created article #<a href='/articles/{art['id']}'>{art['id']}</a>.</div>",
-                    session_user,
+                self._send_raw(
+                    302,
+                    "text/plain; charset=utf-8",
+                    b"Published",
+                    headers={"Location": f"/articles/{new_id}"},
                     allow_body=allow_body,
                 )
-                self._log_event(200, "post_created", payload, {"article_id": art["id"], **payload_summary})
+                self._log_event(302, "article_published", payload, {"article_id": new_id, **payload_summary})
                 return
-            self._send_html(
-                405,
-                "405 Method Not Allowed",
-                "<p>Use GET or POST.</p>",
-                session_user,
-                {"Allow": "GET, POST"},
-                allow_body,
-            )
-            self._log_event(405, "method_not_allowed", payload, payload_summary)
-            return
 
-        if path in {"/admin", "/admin/dashboard", "/admin/posts"}:
-            if self.command not in {"GET", "HEAD"}:
-                self._send_html(
-                    405,
-                    "405 Method Not Allowed",
-                    "<p>Use GET or HEAD.</p>",
-                    session_user,
-                    {"Allow": "GET, HEAD"},
-                    allow_body,
-                )
-                self._log_event(405, "method_not_allowed", payload, payload_summary)
-                return
+        if path in {"/admin", "/admin/dashboard"}:
             snap = self.state.snapshot()
-            self._send_html(
-                200,
-                f"Admin ({path})",
-                f"<pre>{html.escape(json.dumps(snap, indent=2))}</pre>",
-                session_user,
-                allow_body=allow_body,
+            main_html = (
+                "<div class='main-card'><h2 style='margin-top:0;font-size:17px;'>編成デスク管理コンソール</h2>"
+                f"<pre>{html.escape(json.dumps(snap, ensure_ascii=False, indent=2))}</pre></div>"
             )
-            self._log_event(200, "admin_view", payload, payload_summary)
+            self._send_portal(200, "管理コンソール", main_html, session_user=session_user, allow_body=allow_body)
+            self._log_event(200, "admin_exposed_view", payload, payload_summary)
             return
 
-        # 4. IoT device management routes
-        if path in {
-            "/iot/admin",
-            "/iot/status",
-            "/iot/network",
-            "/iot/wifi",
-            "/iot/firmware",
-            "/cgi-bin/luci",
-        }:
-            if self.command == "GET":
-                cfg = self.state.device_config
-                form = (
-                    f"<form method='POST' action='{html.escape(path)}'>"
-                    "<label>WAN Mode</label><select name='wan_mode'><option value='dhcp'>dhcp</option><option value='static'>static</option><option value='pppoe'>pppoe</option></select>"
-                    f"<label>WAN IP</label><input type='text' name='wan_ip' value='{html.escape(cfg['wan']['ip_address'])}'>"
-                    f"<label>LAN IP</label><input type='text' name='lan_ip' value='{html.escape(cfg['lan']['ip_address'])}'>"
-                    f"<label>2.4G SSID</label><input type='text' name='ssid_2g' value='{html.escape(cfg['wifi']['ssid_2g'])}'>"
-                    f"<label>5G SSID</label><input type='text' name='ssid_5g' value='{html.escape(cfg['wifi']['ssid_5g'])}'>"
-                    "<label>Wi-Fi Security</label><select name='wifi_security'><option value='WPA2-PSK'>WPA2-PSK</option><option value='WPA3-SAE'>WPA3-SAE</option><option value='Open'>Open</option></select>"
-                    "<label>Firmware Channel</label><select name='firmware_channel'><option value='stable'>stable</option><option value='beta'>beta</option><option value='canary'>canary</option></select>"
-                    "<label>SSH Management</label><select name='ssh_enabled'><option value='false'>false</option><option value='true'>true</option></select>"
-                    "<button type='submit'>Apply IoT Settings</button></form>"
-                    f"<pre>{html.escape(json.dumps(cfg, indent=2))}</pre>"
-                )
-                self._send_html(200, f"IoT Gateway ({path})", form, session_user, allow_body=allow_body)
-                self._log_event(200, "iot_view", payload, payload_summary)
-                return
-            if self.command == "POST":
-                norm = dict(payload)
-                if "ssh_enabled" in norm:
-                    norm["ssh_enabled"] = str(norm["ssh_enabled"]).lower() in {"1", "true", "yes", "on"}
-                updated = self.state.update_device_config(norm)
-                self._send_html(
-                    200,
-                    "IoT Settings Updated",
-                    f"<div class='notice'>Updated in memory.</div><pre>{html.escape(json.dumps(updated, indent=2))}</pre>",
-                    session_user,
-                    allow_body=allow_body,
-                )
-                self._log_event(200, "iot_updated", payload, payload_summary)
-                return
-            self._send_html(
-                405,
-                "405 Method Not Allowed",
-                "<p>Use GET or POST.</p>",
-                session_user,
-                {"Allow": "GET, POST"},
-                allow_body,
+        if path in {"/iot/admin", "/cgi-bin/luci"}:
+            main_html = (
+                "<div class='main-card'><h2 style='margin-top:0;font-size:17px;'>ニュース配信エッジゲートウェイ設定</h2>"
+                f"<pre>{html.escape(json.dumps(self.state.device_config, indent=2))}</pre></div>"
             )
-            self._log_event(405, "method_not_allowed", payload, payload_summary)
+            self._send_portal(200, "配信設備管理", main_html, session_user=session_user, allow_body=allow_body)
+            self._log_event(200, "iot_admin_view", payload, payload_summary)
             return
 
-        # 5. API & recon decoy endpoints
+        if path == "/robots.txt":
+            txt = (
+                "User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /api/v1/users/profile\n"
+                "Disallow: /api/v1/fetch\nDisallow: /api/v1/tools/ping\nDisallow: /download\n"
+                "Sitemap: /sitemap.xml\n"
+            ).encode("utf-8")
+            self._send_raw(200, "text/plain; charset=utf-8", txt, allow_body=allow_body)
+            self._log_event(200, "robots_txt", payload, payload_summary)
+            return
+
+        if path == "/sitemap.xml":
+            arts = self.state.db.list_articles(limit=30)
+            locs = ["/", "/search"] + [f"/articles/{a['id']}" for a in arts]
+            body_xml = "\n".join(f"  <url><loc>{loc}</loc></url>" for loc in locs)
+            xml = f"<?xml version='1.0' encoding='UTF-8'?>\n<urlset xmlns='http://www.sitemaps.org/schemas/sitemap/0.9'>\n{body_xml}\n</urlset>\n".encode("utf-8")
+            self._send_raw(200, "application/xml; charset=utf-8", xml, allow_body=allow_body)
+            self._log_event(200, "sitemap_xml", payload, payload_summary)
+            return
+
+        if path in {"/feed.xml", "/rss.xml"}:
+            arts = self.state.db.list_articles(limit=20)
+            items_xml = "\n".join(
+                f"  <item><title>{html.escape(str(a['title']))}</title><link>/articles/{a['id']}</link></item>"
+                for a in arts
+            )
+            rss = f"<?xml version='1.0' encoding='UTF-8'?><rss version='2.0'><channel><title>Yaho! News Feed</title>\n{items_xml}\n</channel></rss>".encode("utf-8")
+            self._send_raw(200, "application/rss+xml; charset=utf-8", rss, allow_body=allow_body)
+            self._log_event(200, "feed_xml", payload, payload_summary)
+            return
+
         if path == "/api/v1/status":
-            self._send_json(
-                200,
-                {"status": "ok", "service": "blog-iot-portal", "articles": len(self.state.articles)},
-                allow_body=allow_body,
-            )
+            self._send_json(200, {"status": "ok", "service": "yaho-news-portal", "db": self.state.db.db_path}, allow_body=allow_body)
             self._log_event(200, "api_status", payload, payload_summary)
             return
 
-        if path == "/api/v1/posts":
-            if self.command in {"GET", "HEAD"}:
-                self._send_json(200, {"posts": self.state.articles}, allow_body=allow_body)
-                self._log_event(200, "api_posts_get", payload, payload_summary)
-                return
-            if self.command == "POST":
-                art = self.state.add_article(
-                    str(payload.get("title", "")),
-                    str(payload.get("category", "tech")),
-                    session_user or "api_client",
-                    str(payload.get("body", "")),
-                )
-                self._send_json(200, {"status": "created", "post": art}, allow_body=allow_body)
-                self._log_event(200, "api_posts_post", payload, {"article_id": art["id"], **payload_summary})
-                return
-            self._send_json(405, {"error": "Method Not Allowed"}, {"Allow": "GET, HEAD, POST"}, allow_body)
-            self._log_event(405, "method_not_allowed", payload, payload_summary)
-            return
-
-        if path == "/api/v1/auth/login":
-            if self.command != "POST":
-                self._send_json(405, {"error": "Method Not Allowed"}, {"Allow": "POST"}, allow_body)
-                self._log_event(405, "method_not_allowed", payload, payload_summary)
-                return
-            user = str(payload.get("username", ""))
-            pwd = str(payload.get("password", ""))
-            ok, info = self.state.verify_login(user, pwd, self._client_ip())
-            if ok:
-                token = self.state.create_session(user, info)
-                self._send_json(200, {"status": "ok", "token": token, "role": info}, allow_body=allow_body)
-                self._log_event(200, "api_login_ok", payload, payload_summary)
-            else:
-                self._send_json(401, {"error": info}, {"WWW-Authenticate": "Bearer"}, allow_body)
-                self._log_event(401, "api_login_fail", payload, payload_summary)
-            return
-
-        if path == "/api/v1/device/status":
-            cfg = self.state.device_config
-            self._send_json(
-                200,
-                {
-                    "model": cfg["device_model"],
-                    "firmware": cfg["firmware_version"],
-                    "hostname": cfg["hostname"],
-                },
-                allow_body=allow_body,
-            )
-            self._log_event(200, "api_device_status", payload, payload_summary)
-            return
-
-        if path == "/api/v1/device/config":
-            if self.command in {"GET", "HEAD"}:
-                self._send_json(200, self.state.device_config, allow_body=allow_body)
-                self._log_event(200, "api_device_cfg_get", payload, payload_summary)
-                return
-            if self.command in {"POST", "PUT"}:
-                updated = self.state.update_device_config(payload)
-                self._send_json(200, {"status": "updated", "config": updated}, allow_body=allow_body)
-                self._log_event(200, "api_device_cfg_put", payload, payload_summary)
-                return
-            self._send_json(405, {"error": "Method Not Allowed"}, {"Allow": "GET, HEAD, POST, PUT"}, allow_body)
-            self._log_event(405, "method_not_allowed", payload, payload_summary)
-            return
-
         if path == "/.env":
-            self._send_raw(
-                200,
-                "text/plain; charset=utf-8",
-                self.state.dotenv_decoy.encode("utf-8"),
-                allow_body=allow_body,
-            )
+            self._send_raw(200, "text/plain; charset=utf-8", self.state.dotenv_decoy.encode("utf-8"), allow_body=allow_body)
             self._log_event(200, "decoy_dotenv", payload, payload_summary)
             return
 
@@ -1478,33 +1707,23 @@ class HoneypotHandler(BaseHTTPRequestHandler):
             self._log_event(200, "decoy_config_json", payload, payload_summary)
             return
 
-        if path == "/backup.zip":
-            self._send_json(403, {"error": "Forbidden"}, allow_body=allow_body)
-            self._log_event(403, "decoy_backup_zip", payload, payload_summary)
-            return
-
         if path in {"/actuator", "/actuator/env"}:
             self._send_json(200, self.state.emulator.actuator_env_decoy, allow_body=allow_body)
             self._log_event(200, "decoy_actuator", payload, payload_summary)
             return
 
-        if path == "/server-status":
-            self._send_json(501, {"error": "Not Implemented"}, allow_body=allow_body)
-            self._log_event(501, "decoy_server_status", payload, payload_summary)
-            return
-
-        self._send_html(
+        self._send_portal(
             404,
-            "404 Not Found",
-            f"<p>Not found: <code>{html.escape(path)}</code></p>",
-            session_user,
+            "ページが見つかりません",
+            f"<div class='main-card'><p>指定されたURL（<code>{html.escape(path)}</code>）は見つかりませんでした。</p></div>",
+            session_user=session_user,
             allow_body=allow_body,
         )
         self._log_event(404, "not_found", payload, payload_summary)
 
 
 def run_honeypot(host: str = "127.0.0.1", port: int = 8080) -> None:
-    """Start the expanded Medium-Interaction Blog + IoT + Web Decoy honeypot server."""
+    """Start the Yaho! News-style SQLite honeypot server."""
     state = HoneypotState()
     HoneypotHandler.state = state
     httpd = ThreadingHTTPServer((host, port), HoneypotHandler)
@@ -1516,7 +1735,7 @@ def run_honeypot(host: str = "127.0.0.1", port: int = 8080) -> None:
             "path": "/",
             "status_code": 200,
             "outcome": "listening",
-            "payload": {"port": port},
+            "payload": {"port": port, "sqlite_db": state.db.db_path},
         }
     )
     try:

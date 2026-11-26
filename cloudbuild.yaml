@@ -1,37 +1,55 @@
 steps:
-  - name: 'gcr.io/cloud-builders/docker'
+  # 1. honeypot-http イメージのビルドとプッシュ（並列実行）
+  - id: 'build-honeypot-http'
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['-']
     args:
       - 'build'
       - '-f'
       - 'app/Dockerfile'
       - '-t'
       - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
+      - '-t'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:$SHORT_SHA'
       - '.'
 
-  - name: 'gcr.io/cloud-builders/docker'
+  - id: 'push-honeypot-http'
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['build-honeypot-http']
     args:
       - 'push'
-      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
+      - '--all-tags'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http'
 
-  - name: 'gcr.io/cloud-builders/docker'
+  # 2. hp-nginx イメージのビルドとプッシュ（並列実行）
+  - id: 'build-hp-nginx'
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['-']
     args:
       - 'build'
       - '-f'
       - 'nginx/Dockerfile'
       - '-t'
       - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+      - '-t'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:$SHORT_SHA'
       - 'nginx'
 
-  - name: 'gcr.io/cloud-builders/docker'
+  - id: 'push-hp-nginx'
+    name: 'gcr.io/cloud-builders/docker'
+    waitFor: ['build-hp-nginx']
     args:
       - 'push'
-      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+      - '--all-tags'
+      - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx'
 
-  # ★ポートを開けずにVMのスタートアップスクリプトを更新し、VMをリセットして最新版を自動適用
-  - name: 'gcr.io/://google.com'
+  # 3. イメージプッシュ完了後に VM の startup-script を更新しリセット
+  - id: 'update-and-reset-vm'
+    name: 'gcr.io/cloud-builders/gcloud'
+    waitFor: ['push-honeypot-http', 'push-hp-nginx']
     entrypoint: 'bash'
     args:
-      - '-c'
+      - '-ceu'
       - |
         gcloud compute instances add-metadata hp-vm-us-01 \
           --zone=us-central1-a \
@@ -43,4 +61,9 @@ steps:
 
 images:
   - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:latest'
+  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/honeypot-http:$SHORT_SHA'
   - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:latest'
+  - 'asia-northeast1-docker.pkg.dev/honeypot-515503/cloud-run-source-deploy/hp-nginx:$SHORT_SHA'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
